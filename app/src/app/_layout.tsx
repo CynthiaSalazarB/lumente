@@ -9,10 +9,10 @@ import { Stack, type ErrorBoundaryProps } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import * as SystemUI from "expo-system-ui";
 import { useEffect, useMemo } from "react";
-import { Platform, StyleSheet, View } from "react-native";
+import { ActivityIndicator, Platform, StyleSheet, View } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { Failure } from "../components/messages.tsx";
-import { Button, Screen, Title } from "../components/ui.tsx";
+import { Button, Screen, Small, Title, useColors } from "../components/ui.tsx";
 import { useBrandFonts } from "../components/use-brand-fonts.ts";
 import type { SessionClient } from "../session/client.ts";
 import { clerkKey, createClient } from "../session/config.ts";
@@ -88,7 +88,7 @@ const BRAND_FONTS = {
 function RootLayout() {
   const [loaded, failed] = useBrandFonts(BRAND_FONTS);
   // a font that fails to load falls back to the system's rather than blocking the app
-  if (!loaded && !failed) return null;
+  if (!loaded && !failed) return <Loading />;
   return (
     <SafeAreaProvider>
       {clerkKey ? (
@@ -107,10 +107,22 @@ function RootLayout() {
 function ClerkApp() {
   const { isLoaded, isSignedIn, userId, getToken } = useAuth();
   const client = useMemo(() => createClient(() => getToken()), [getToken]);
-  // nothing to show until Clerk knows whether someone is signed in
-  if (!isLoaded) return null;
+  // no screen until Clerk knows whether someone is signed in
+  if (!isLoaded) return <Loading />;
   // Expiry and account switching can bypass our Sign out button; no previous learner's UI survives an identity change.
   return <App key={userId ?? "signed-out"} client={client} signedIn={!!isSignedIn} clerk />;
+}
+
+/** Until the fonts register and Clerk loads. On the web this is the exported page, so it shows before the bundle
+ * and Clerk's script arrive (seconds on a phone network); a phone shows its splash over it. */
+function Loading() {
+  const c = useColors();
+  return (
+    <View style={styles.loading} accessibilityRole="status" accessibilityLiveRegion="polite">
+      <ActivityIndicator color={c.onSurface} />
+      <Small dim>Loading {brand.name}…</Small>
+    </View>
+  );
 }
 
 function App({ client, signedIn, clerk }: { client: SessionClient; signedIn: boolean; clerk: boolean }) {
@@ -136,5 +148,6 @@ function App({ client, signedIn, clerk }: { client: SessionClient; signedIn: boo
 }
 
 const styles = StyleSheet.create({
+  loading: { flex: 1, alignItems: "center", justifyContent: "center", gap: space.m },
   error: { flex: 1, justifyContent: "center", gap: space.xl, paddingHorizontal: space.margin, width: "100%", maxWidth: 560, alignSelf: "center" },
 });

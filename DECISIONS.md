@@ -968,3 +968,15 @@ Format: **Decision** · **Instead of** · **Why** · **Pattern / trade-off**
 - **Pattern / trade-off:** validate new requests strictly while retaining the stored format. Old long answers
   remain in their sessions; agent input and output schemas keep their existing bounds.
 
+### 2026-10-29 · The web's first paint is a loading line, not a blank screen
+- **Decision:** while fonts register and Clerk reports `isLoaded`, the root layout renders the house loading
+  view (a spinner and "Loading Lumente…") instead of `null`. Static export therefore includes that line in the
+  HTML, so a cold load paints something before the bundle and Clerk's script finish.
+- **Instead of:** `return null` until both gates pass, which leaves the page as the dark HTML background for
+  about 2–3 seconds on a fast connection and about 8 seconds on slow 4G.
+- **Why:** testers hitting `lumente.expo.app` saw a blank dark screen long enough to think production was
+  broken, while `lumente--testers.expo.app` (same build) looked fine if they waited or had a warmer cache.
+  Fonts already swap in without blocking (25 Oct). Clerk's `isLoaded` was the remaining gate that hid the page.
+- **Pattern / trade-off:** the first frame uses fallback fonts and a spinner, not the finished sign-in. Native
+  still covers it with the splash. Session behaviour, routes and Clerk's signed-in check are unchanged.
+
