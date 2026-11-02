@@ -161,6 +161,7 @@ test("the store against a real SurrealDB", { skip: url ? false : "set SURREAL_TE
     await store.logAgentCall({ session: api2.id, agent: "coach", input: { concept: "API" }, output: {}, ms: 1, usd: 0 });
     await store.logAgentCall({ session: api1.id, agent: "questioner", input: facts("attr_9"), output: {}, ms: 1, usd: 0 });
     await store.logAgentCall({ session: theirs.id, agent: "coach", input: facts("attr_8"), output: {}, ms: 1, usd: 0 });
+    await store.logAgentCall({ session: api1.id, agent: "coach", input: facts("failed"), output: {}, ms: 1, usd: 0, attempt: 1, outcome: "failed", costStatus: "unknown" });
     const reads = (await store.memoryReads("reader")).sort((a, b) => b.length - a.length);
     assert.deepEqual(reads, [["attr_1", "attr_2"], ["attr_1"], []]);
     const [dropped] = await db.query("SELECT VALUE dropped FROM agent_log WHERE agent = 'hint_giver'").collect<[string[][]]>();

@@ -1,7 +1,7 @@
 // The learner writes answers on the map; the optional fact desk answers factual questions.
 // Firefly's navigation cue highlights the next empty area without giving conceptual help or changing scores.
 import { MOVE_ORDER, type Item, type Mentefacto, type MoveId, type Turn } from "@build-north/agents";
-import { useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { KeyboardAvoidingView, Modal, Pressable, ScrollView, StyleSheet, TextInput, View, type ScrollViewInstance } from "react-native";
 import Animated from "react-native-reanimated";
 import { AREA_LABEL, areaCopyOf } from "../area-copy.ts";
@@ -150,6 +150,7 @@ export function WholeMapScreen({ turn, state, send, retry, edit, onClose }: Prop
           concept={concept}
           category={categoryContextOf(map)}
           items={itemsOf(map, editing)}
+          onDraft={(items) => edit(withPart(map, editing, items))}
           onDone={(items) => {
             edit(withPart(map, editing, items));
             setEditing(null);
@@ -272,7 +273,7 @@ function AskBar({ concept, pending, asking, onAsk }: { concept: string; pending:
 
 /** One part of the map, in a sheet (a dialog in the website layout): the bigger group is one field; the other
  * parts are lists, and each thing it isn't carries how it differs. Closing it keeps what was typed. */
-function PartEditor({ move, concept, category, items, onDone }: { move: MoveId; concept: string; category: string | null; items: Item[]; onDone: (items: Item[]) => void }) {
+function PartEditor({ move, concept, category, items, onDraft, onDone }: { move: MoveId; concept: string; category: string | null; items: Item[]; onDraft: (items: Item[]) => void; onDone: (items: Item[]) => void }) {
   const c = useColors();
   const wide = useWide();
   const entrance = useEntrance();
@@ -280,8 +281,34 @@ function PartEditor({ move, concept, category, items, onDone }: { move: MoveId; 
   const nextRow = useRef(Math.max(items.length, 1));
   const blank = () => ({ id: nextRow.current++, value: "", note: null });
   const [rows, setRows] = useState<(Item & { id: number })[]>(() => (items.length > 0 ? items : [{ value: "", note: null }]).map((row, id) => ({ ...row, id })));
-  const change = (i: number, patch: Partial<Item>) => setRows((now) => now.map((row, j) => (j === i ? { ...row, ...patch } : row)));
-  const done = () => onDone(rows.map(({ value, note }) => ({ value, note })));
+  const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const latestRows = useRef(rows);
+  const onDraftRef = useRef(onDraft);
+  useEffect(() => {
+    onDraftRef.current = onDraft;
+  }, [onDraft]);
+  const valuesOf = (source: (Item & { id: number })[]) => source.map(({ value, note }) => ({ value, note }));
+  useEffect(() => () => {
+    if (draftTimer.current === null) return;
+    clearTimeout(draftTimer.current);
+    draftTimer.current = null;
+    onDraftRef.current(latestRows.current.map(({ value, note }) => ({ value, note })));
+  }, []);
+  const publish = (next: (Item & { id: number })[]) => {
+    latestRows.current = next;
+    setRows(next);
+    if (draftTimer.current !== null) clearTimeout(draftTimer.current);
+    draftTimer.current = setTimeout(() => {
+      draftTimer.current = null;
+      onDraftRef.current(valuesOf(next));
+    }, 400);
+  };
+  const change = (i: number, patch: Partial<Item>) => publish(latestRows.current.map((row, j) => (j === i ? { ...row, ...patch } : row)));
+  const done = () => {
+    if (draftTimer.current !== null) clearTimeout(draftTimer.current);
+    draftTimer.current = null;
+    onDone(valuesOf(latestRows.current));
+  };
   // the mic in the head dictates into the field last focused (the first item until one is)
   const [focus, setFocus] = useState<{ i: number; part: "value" | "note" }>({ i: 0, part: "value" });
   const voice = useVoice({
@@ -290,13 +317,14 @@ function PartEditor({ move, concept, category, items, onDone }: { move: MoveId; 
   });
   const remove = (i: number) => {
     voice.cancel();
+    const current = latestRows.current;
     const empty = blank();
-    setRows((now) => (now.length > 1 ? now.filter((_, j) => j !== i) : [empty]));
-    setFocus((now) => ({ ...now, i: i < now.i ? now.i - 1 : Math.min(now.i, Math.max(0, rows.length - 2)) }));
+    publish(current.length > 1 ? current.filter((_, j) => j !== i) : [empty]);
+    setFocus((now) => ({ ...now, i: i < now.i ? now.i - 1 : Math.min(now.i, Math.max(0, current.length - 2)) }));
   };
   const add = () => {
     const row = blank();
-    setRows((now) => [...now, row]);
+    publish([...latestRows.current, row]);
   };
   // no custom line height on these fields: on Android a multiline one would show only its last line
   const field = [styles.input, { fontFamily: type.input.fontFamily, fontSize: type.input.fontSize, color: c.onSurface, backgroundColor: c.surface, borderColor: c.fieldEdge }];

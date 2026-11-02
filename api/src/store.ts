@@ -33,6 +33,11 @@ DEFINE FIELD OVERWRITE session ON agent_log TYPE record<session>;
 DEFINE FIELD OVERWRITE agent ON agent_log TYPE string;
 DEFINE FIELD OVERWRITE ms ON agent_log TYPE int;
 DEFINE FIELD OVERWRITE usd ON agent_log TYPE number;
+DEFINE FIELD OVERWRITE callId ON agent_log TYPE option<string>;
+DEFINE FIELD OVERWRITE attempt ON agent_log TYPE option<int>;
+DEFINE FIELD OVERWRITE outcome ON agent_log TYPE option<"success" | "failed">;
+DEFINE FIELD OVERWRITE costStatus ON agent_log TYPE option<"measured" | "unknown" | "not_charged">;
+DEFINE FIELD OVERWRITE status ON agent_log TYPE option<int>;
 DEFINE FIELD OVERWRITE at ON agent_log TYPE datetime DEFAULT time::now() READONLY;
 DEFINE FIELD OVERWRITE user ON agent_log TYPE option<string>;
 DEFINE INDEX OVERWRITE agent_log_session ON agent_log FIELDS session;
@@ -42,7 +47,7 @@ DEFINE INDEX OVERWRITE agent_log_user ON agent_log FIELDS user;
 /** `dropped`: on a coach or hint giver row, the fact ids its output cited that the API hadn't passed in (CONTRACTS.md, Memory).
  * `user`: the learner the call was for, so Delete my data finds the row even after its session is gone (rows from
  * before Oct 28 have none, and go by their session). */
-export type AgentLogEntry = { session: string; user?: string; agent: string; input: unknown; output: unknown; ms: number; usd: number; dropped?: string[] };
+export type AgentLogEntry = { session: string; user?: string; agent: string; input: unknown; output: unknown; ms: number; usd: number; dropped?: string[]; callId?: string; attempt?: number; outcome?: "success" | "failed"; costStatus?: "measured" | "unknown" | "not_charged"; status?: number };
 
 /** A move a Turn moved on: the level it reached and the unassisted successes it added (`changedMoves` in app.ts). */
 export type MasteryProgress = { move: MoveId; level: Level; gained: number };
@@ -205,9 +210,9 @@ export function createStore(db: Surreal): Store {
       );
     },
 
-    async logAgentCall({ session, user, agent, input, output, ms, usd, dropped }) {
+    async logAgentCall({ session, user, agent, input, output, ms, usd, dropped, ...attempt }) {
       await one("CREATE agent_log CONTENT $entry RETURN NONE", {
-        entry: { session: sessionId(session), ...(user ? { user } : {}), agent, input, output, ms: Math.round(ms), usd, ...(dropped ? { dropped } : {}) },
+        entry: { ...attempt, session: sessionId(session), ...(user ? { user } : {}), agent, input, output, ms: Math.round(ms), usd, ...(dropped ? { dropped } : {}) },
       });
     },
 
@@ -218,7 +223,7 @@ export function createStore(db: Surreal): Store {
 
     async memoryReads(user) {
       // a path through the facts array gives the ids as one array; NONE on a call that got no memory
-      const rows = await one<{ ids: unknown }[]>('SELECT input.memory.facts.id AS ids FROM agent_log WHERE session.user = $user AND agent IN ["hint_giver", "coach"]', { user });
+      const rows = await one<{ ids: unknown }[]>('SELECT input.memory.facts.id AS ids FROM agent_log WHERE session.user = $user AND agent IN ["hint_giver", "coach"] AND (outcome = "success" OR outcome = NONE)', { user });
       return rows.map((row) => (Array.isArray(row.ids) ? row.ids.filter((id): id is string => typeof id === "string") : []));
     },
 

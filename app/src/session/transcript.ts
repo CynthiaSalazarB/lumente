@@ -14,7 +14,7 @@ export type Entry =
 export type Failure = { message: string; retryable: boolean; body: TurnBody };
 
 /** A guided answer typed and not sent yet, with the part it was typed on (null before the moves: the first explanation). */
-export type Unsent = { move: MoveId | null; text: string };
+export type Unsent = { move: MoveId | null; text: string; turn?: number };
 
 export type SessionState = {
   /** The latest Turn: what the screen asks for next, the map, the progress. */
@@ -71,15 +71,19 @@ export const partOf = (turn: Turn): MoveId | null => (turn.phase === "move" ? tu
 /** The learner's words in the guided answer field, not sent yet, on `move` of session `sessionId`: kept so Save and close
  * keeps them, and they come back on that part only (a reveal moves the session to the next part before the field
  * goes). Blank words keep nothing. The same state comes back when nothing changed (code review, Oct 26). */
-export function typed(state: SessionState, sessionId: string, move: MoveId | null, text: string): SessionState {
+export function typed(state: SessionState, sessionId: string, move: MoveId | null, text: string, edited = false): SessionState {
   if (state.turn?.sessionId !== sessionId || state.turn.expects !== "text") return state;
+  // A retryable failure may already have reached the server; only retry its exact body until the latest Turn is known.
+  if ((state.failure?.retryable && "text" in state.failure.body)) return state;
   const answer = text.trim() ? { move, text } : null;
+  // An explicit edit replaces the failed submission; passive field cleanup after Send does not.
+  if (edited) return { ...state, answer, failure: null };
   return answer?.text === state.answer?.text && answer?.move === state.answer?.move ? state : { ...state, answer };
 }
 
 /** The unsent words for the part the latest Turn asks about, or "" when there are none for it. */
 export const unsentOf = (state: SessionState): string =>
-  state.turn && state.answer && state.answer.move === partOf(state.turn) ? state.answer.text : "";
+  state.turn?.expects === "text" && state.answer && state.answer.move === partOf(state.turn) && (state.answer.turn === undefined || state.answer.turn === state.turn.turn) ? state.answer.text : "";
 
 /** A Turn came back. Only a newer Turn adds messages: a resend, a 409 or an error Turn repeats the
  * latest one, which is already on screen. */

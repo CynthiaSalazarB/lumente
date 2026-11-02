@@ -22,3 +22,5 @@ build/
 Thumbs.db
 .vscode/
 .idea/
+
+app/dist-*/

@@ -968,3 +968,21 @@ Format: **Decision** · **Instead of** · **Why** · **Pattern / trade-off**
 - **Pattern / trade-off:** validate new requests strictly while retaining the stored format. Old long answers
   remain in their sessions; agent input and output schemas keep their existing bounds.
 
+### 2026-10-28 · Bound memory retries before deleting a learner's scope
+- **Decision:** fact writes reuse an idempotency key derived from their exact body. Scope registration and each fact
+  get at most three attempts, checking the deletion stop signal before every attempt. One failed fact does not stop
+  other facts; failures are reported together. The 30-second limit is the HTTP wait for learner writes, not the retry stop.
+- **Why:** one Memory blip (a 503, a 429, a dropped connection) lost that fact for good; an unbounded retry, tried
+  first, blocked Delete my data and the learner's later writes during an outage.
+- **Trade-off:** the fence is process-local. A timed-out provider write can still commit late, so the write waits one
+  more write's time before the purge, as before; that wait, bounded retries and idempotency do not establish provider
+  ordering across purge, restart, or multiple API processes.
+
+### 2026-10-29 · One explicit Claude retry with a process-local budget
+- **Decision:** Leo approved: "Retry once. Count the retry against the budget cap and log it in agent_log." and
+  "Keep process-local cap". Disable SDK retries; allow at most two transport attempts, keeping `MAX_TOKENS` fixed.
+  Record each completed attempt with its outcome and measured cost. Unknown costs are marked `unknown`, without
+  permanent reservations. Retry delays are capped at 60 seconds. New log fields are optional for rollback compatibility.
+- **Why:** invisible SDK retries hid failed attempts; pre-call logging and retained reservations could disable calls
+  after database or network failures. Durable Turn claims and automatic client resends are outside the approved scope.
+- **Trade-off:** restart resets the cap, concurrent calls may overshoot it, and unknown usage cannot be measured locally.

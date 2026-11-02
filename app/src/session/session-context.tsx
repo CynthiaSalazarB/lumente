@@ -9,7 +9,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState, ty
 import { ClientError, type SessionClient } from "./client.ts";
 import { createSavedSessions, savedOf } from "./saved.ts";
 import { deviceStorage } from "./storage.ts";
-import { arrived, drafted, failed, initialState, replayed, resendOf, sent, startedWith, typed, withRevealed, type SessionState } from "./transcript.ts";
+import { arrived, drafted, failed, initialState, replayed, resendOf, sent, startedWith, typed, unsentOf, withRevealed, type SessionState } from "./transcript.ts";
 
 /** What the learner can send: a /turns body without its `turn` number, which the provider adds. */
 export type LearnerInput = Exclude<TurnInput, { action: "start" }>;
@@ -24,7 +24,7 @@ type SessionApi = {
   /** Level 5: keeps the learner's map; `send({ mentefacto })` submits it. */
   edit(draft: Mentefacto): void;
   /** The guided answer field's words, not sent yet, on `move` of session `sessionId` (`typed` in transcript.ts). */
-  type(sessionId: string, move: MoveId | null, text: string): void;
+  type(sessionId: string, move: MoveId | null, text: string, edited?: boolean): void;
   /** The learner's sessions on the server, newest first (GET /sessions); null until the first read. Demo mode has none. */
   history: SessionSummary[] | null;
   /** Reads the list again (Start does when it is shown). Resolves with an error message, or null; undefined when a newer
@@ -76,8 +76,8 @@ export function SessionProvider({ client, children }: { client: SessionClient; c
       if (request !== listRequest.current) return undefined;
       setHistory(list);
       // Don't prune a record created while this list request was in flight; the response can predate that session.
-      const unfinishedIds = new Set(list.filter((session) => !session.finished).map((session) => session.id));
-      await saved.current!.prune(knownIds, unfinishedIds);
+      const finishedIds = new Set(list.filter((session) => session.finished).map((session) => session.id));
+      await saved.current!.prune(knownIds, finishedIds);
       return null;
     } catch (error) {
       if (request !== listRequest.current) return undefined;
@@ -132,8 +132,8 @@ export function SessionProvider({ client, children }: { client: SessionClient; c
     edit(draft) {
       setState((s) => drafted(s, draft));
     },
-    type(sessionId, move, text) {
-      setState((s) => typed(s, sessionId, move, text));
+    type(sessionId, move, text, edited) {
+      setState((s) => typed(s, sessionId, move, text, edited));
     },
     history,
     refresh,
@@ -152,13 +152,14 @@ export function SessionProvider({ client, children }: { client: SessionClient; c
         // the latest Turn says whether the session is still there (a 404 when it isn't); the steps bring its whole
         // conversation back, and without them (an older session, or an API from before they were kept) the latest
         // Turn shows alone
-        const [turn, steps] = await Promise.all([client.resume(id), client.transcript(id).catch(() => null)]);
+        const [turn, transcript] = await Promise.all([client.resume(id), client.transcript(id).catch(() => null)]);
         const kept = await saved.current!.get(id);
         if (version !== epoch.current) return CLEARED;
         // the server's map holds what Help revealed; the learner's own words come back from the device, the level-5 map
         // and an answer they hadn't sent yet with them
-        const back = replayed(steps, turn, mode, kept?.material ?? null);
-        setState({ ...(kept?.draft ? drafted(back, withRevealed(kept.draft, turn.mentefacto)) : back), answer: kept?.answer ?? null });
+        const back = replayed(transcript?.steps ?? null, turn, mode, transcript?.material === undefined ? kept?.material ?? null : transcript.material);
+        const answer = kept?.answer ?? null;
+        setState({ ...(kept?.draft ? drafted(back, withRevealed(kept.draft, turn.mentefacto)) : back), answer: unsentOf({ ...back, answer }) ? answer : null });
         return null;
       } catch (error) {
         if (version !== epoch.current) return CLEARED;

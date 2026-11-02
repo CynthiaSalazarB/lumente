@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
+import { randomUUID } from "node:crypto";
 import { AGENTS, verifyCites, type AgentDefinition, type AgentName, type CallAgent, type CoachOutput, type HintGiverOutput, type LearnerMemory } from "@build-north/agents";
 import type { AgentLogEntry } from "./store.ts";
 
@@ -36,8 +37,8 @@ export function agentConfigFromEnv(env: NodeJS.ProcessEnv = process.env): AgentC
   const model = env.AGENT_MODEL?.trim() || "claude-opus-5-5";
   if (!PRICES[model]) throw new Error(`AGENT_MODEL must be one of: ${Object.keys(PRICES).join(", ")}`);
   const budgetUsd = Number(env.AGENT_BUDGET_USD);
-  if (!(budgetUsd > 0)) {
-    throw new Error("ANTHROPIC_API_KEY is set, so AGENT_BUDGET_USD (the Claude budget in dollars) is required");
+  if (!Number.isFinite(budgetUsd) || budgetUsd <= 0) {
+    throw new Error("ANTHROPIC_API_KEY is set, so AGENT_BUDGET_USD must be a finite positive budget in dollars");
   }
   return { model, budgetUsd };
 }
@@ -91,35 +92,79 @@ function windowsFrom(headers: Headers): Window[] {
   return windows;
 }
 
-const dollars = (usage: Usage, price: (typeof PRICES)[string]) =>
-  (usage.input_tokens * price.input +
-    (usage.cache_creation_input_tokens ?? 0) * price.cacheWrite +
-    (usage.cache_read_input_tokens ?? 0) * price.cacheRead +
-    usage.output_tokens * price.output) /
-  1_000_000;
+const tokenCount = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
-// Worth a retry: rate limits, timeouts, dropped connections and Anthropic's own errors. A 4xx means
-// the request itself is wrong, and a retry would send the same request.
+const dollars = (usage: unknown, price: (typeof PRICES)[string]): number | null => {
+  if (typeof usage !== "object" || usage === null) return null;
+  const counts = usage as Record<string, unknown>;
+  const { input_tokens: input, output_tokens: output } = counts;
+  const cacheWrite = counts.cache_creation_input_tokens;
+  const cacheRead = counts.cache_read_input_tokens;
+  if (!tokenCount(input) || !tokenCount(output)) return null;
+  if (cacheWrite != null && !tokenCount(cacheWrite)) return null;
+  if (cacheRead != null && !tokenCount(cacheRead)) return null;
+
+  const usd = (
+    input * price.input +
+    (cacheWrite ?? 0) * price.cacheWrite +
+    (cacheRead ?? 0) * price.cacheRead +
+    output * price.output
+  ) / 1_000_000;
+  return Number.isFinite(usd) ? usd : null;
+};
+
+// Match the SDK's retryable transport and status failures while making each paid attempt visible.
 function failure(agent: AgentName, error: unknown): AgentCallError {
   const message = `The ${agent} call failed: ${error instanceof Error ? error.message : String(error)}`;
-  if (error instanceof Anthropic.RateLimitError) return new AgentCallError("rate_limited", true, message, { cause: error });
+  if (error instanceof Anthropic.RateLimitError) {
+    return new AgentCallError("rate_limited", error.headers?.get("x-should-retry") !== "false", message, { cause: error });
+  }
   if (error instanceof Anthropic.APIConnectionError) return new AgentCallError("agent_failed", true, message, { cause: error });
   if (error instanceof Anthropic.APIError) {
-    return new AgentCallError("agent_failed", (error.status ?? 500) >= 500, message, { cause: error });
+    const override = error.headers?.get("x-should-retry");
+    const status = error.status ?? 500;
+    const retryable = override === "true" || (override !== "false" && (status === 408 || status === 409 || status === 429 || status >= 500));
+    return new AgentCallError(status === 429 ? "rate_limited" : "agent_failed", retryable, message, { cause: error });
   }
   return new AgentCallError("agent_failed", false, message, { cause: error });
+}
+
+function retryDelayMs(error: unknown): number {
+  if (error instanceof Anthropic.APIError) {
+    const milliseconds = error.headers?.get("retry-after-ms");
+    if (milliseconds) {
+      const value = Number(milliseconds);
+      if (Number.isFinite(value) && value > 0 && value <= 2 ** 31 - 1) return Math.min(value, 60_000);
+    }
+    const retryAfter = error.headers?.get("retry-after");
+    if (retryAfter) {
+      const seconds = Number(retryAfter);
+      const value = Number.isFinite(seconds) ? seconds * 1_000 : Date.parse(retryAfter) - Date.now();
+      if (Number.isFinite(value) && value > 0 && value <= 2 ** 31 - 1) return Math.min(value, 60_000);
+    }
+  }
+  return 500 + Math.random() * 125;
 }
 
 // One callAgent per session, so every agent_log row names its session, and the learner it was for when the caller says
 // (Delete my data finds a row by them once the session is gone). The spend and the rate-limit windows are shared by
 // all sessions.
 export function createCallAgent({ send, model, budgetUsd, log }: CallAgentOptions): (sessionId: string, user?: string) => CallAgent {
+  if (!Number.isFinite(budgetUsd) || budgetUsd <= 0) throw new Error("Claude budget must be finite and positive");
   const price = PRICES[model];
   if (!price) throw new Error(`There's no price for ${model}, so the budget can't be counted`);
   // Counted in memory, so it starts again at $0 after a restart; the account's own balance, with
   // auto-reload off (#20), is the hard stop.
   let spentUsd = 0;
   let windows: Window[] = [];
+
+  const checkWindows = () => {
+    const full = windows.find((window) => window.used >= STOP_AT && window.resetsAt > Date.now());
+    if (full) {
+      throw new AgentCallError("rate_limited", true, `A Claude rate limit is ${Math.round(full.used * 100)}% used until ${new Date(full.resetsAt).toISOString()}`);
+    }
+  };
 
   const call = async (sessionId: string, user: string | undefined, agent: AgentName, input: unknown): Promise<unknown> => {
     const spec = REGISTRY[agent];
@@ -128,74 +173,113 @@ export function createCallAgent({ send, model, budgetUsd, log }: CallAgentOption
     if (!parsed.success) {
       throw new AgentCallError("agent_failed", false, `The ${agent} input doesn't fit its schema: ${parsed.error.message}`);
     }
-    if (spentUsd >= STOP_AT * budgetUsd) {
-      throw new AgentCallError("rate_limited", false, `$${spentUsd.toFixed(2)} of the $${budgetUsd} Claude budget is spent`);
-    }
-    const full = windows.find((window) => window.used >= STOP_AT && window.resetsAt > Date.now());
-    if (full) {
-      throw new AgentCallError("rate_limited", true, `A Claude rate limit is ${Math.round(full.used * 100)}% used until ${new Date(full.resetsAt).toISOString()}`);
-    }
+    checkWindows();
 
-    const started = performance.now();
-    let reply: ClaudeReply;
-    try {
-      reply = await send({
-        model,
-        max_tokens: MAX_TOKENS,
-        system: spec.system,
-        messages: [{ role: "user", content: spec.render(parsed.data) }],
-        output_config: { effort: spec.effort, format: zodOutputFormat(spec.output) },
+    const params: Anthropic.MessageCreateParamsNonStreaming = {
+      model,
+      max_tokens: MAX_TOKENS,
+      system: spec.system,
+      messages: [{ role: "user", content: spec.render(parsed.data) }],
+      output_config: { effort: spec.effort, format: zodOutputFormat(spec.output) },
+    };
+    const callId = randomUUID();
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      checkWindows();
+      if (spentUsd >= STOP_AT * budgetUsd) {
+        throw new AgentCallError("rate_limited", false, `$${spentUsd.toFixed(2)} of the $${budgetUsd} Claude budget is spent`);
+      }
+      const finish = async (entry: AgentLogEntry) => {
+        try { await log(entry); }
+        catch (error) { console.error("agent_log write failed:", error); }
+      };
+      const started = performance.now();
+      let reply: ClaudeReply;
+      try {
+        reply = await send(params);
+      } catch (error) {
+        const ms = performance.now() - started;
+        if (error instanceof Anthropic.APIError && error.headers) windows = windowsFrom(error.headers);
+        const callError = failure(agent, error);
+        const hasProviderErrorResponse = error instanceof Anthropic.APIError && !(error instanceof Anthropic.APIConnectionError);
+        const status = hasProviderErrorResponse ? error.status : undefined;
+        const costStatus = hasProviderErrorResponse ? "not_charged" as const : "unknown" as const;
+        await finish({
+          session: sessionId, ...(user ? { user } : {}), agent, input: parsed.data,
+          output: { error: callError.code, retryable: callError.retryable }, ms,
+          usd: 0,
+          callId, attempt, outcome: "failed", costStatus, ...(status ? { status } : {}),
+        });
+        if (attempt === 1 && callError.retryable) {
+          await new Promise((resolve) => setTimeout(resolve, retryDelayMs(error)));
+          continue;
+        }
+        throw callError;
+      }
+      const ms = performance.now() - started;
+      windows = windowsFrom(reply.headers);
+      const measuredUsd = dollars(reply.message.usage, price);
+      const costStatus = measuredUsd === null ? "unknown" as const : "measured" as const;
+      const usd = measuredUsd ?? 0;
+      spentUsd += usd;
+      if (measuredUsd === null) console.error(`Claude returned invalid token usage for ${agent}; cost unknown`);
+
+      const { content, stop_reason } = reply.message;
+      let output: unknown;
+      let callError: AgentCallError | null = null;
+      if (stop_reason === "refusal") {
+        callError = new AgentCallError("agent_failed", false, `Claude declined the ${agent} call`);
+      } else {
+        try {
+          // thinking blocks may come first; the JSON is in the text block
+          output = spec.output.parse(JSON.parse(content.find((block) => block.type === "text")?.text ?? ""));
+        } catch (error) {
+          const reason = `The ${agent} reply didn't fit its schema (stop reason: ${stop_reason})`;
+          callError = new AgentCallError("agent_failed", true, reason, { cause: error });
+        }
+      }
+      if (callError) {
+        await finish({
+          session: sessionId, ...(user ? { user } : {}), agent, input: parsed.data,
+          output: { error: callError.code, retryable: callError.retryable, stopReason: stop_reason },
+          ms, usd, callId, attempt, outcome: "failed", costStatus,
+        });
+        throw callError;
+      }
+      // CONTRACTS.md section 2, Memory: a message may cite only the facts it was given; the ids it made up are
+      // dropped here and kept on the log row, so a made-up source can never reach the screen.
+      let dropped: string[] = [];
+      if (agent === "coach" || agent === "hint_giver") {
+        const verified = verifyCites(output as CoachOutput | HintGiverOutput, (parsed.data as { memory?: LearnerMemory }).memory);
+        output = verified.output;
+        dropped = verified.dropped;
+        if (dropped.length > 0) console.warn(`The ${agent} cited ${dropped.length} fact id(s) it wasn't given (session ${sessionId}): ${dropped.join(", ")}`);
+      }
+      // Each completed attempt records its measured cost, including failed responses.
+      await finish({
+        session: sessionId, ...(user ? { user } : {}), agent, input: parsed.data, output,
+        ms, usd, callId, attempt, outcome: "success", costStatus, ...(dropped.length > 0 ? { dropped } : {}),
       });
-    } catch (error) {
-      if (error instanceof Anthropic.APIError && error.headers) windows = windowsFrom(error.headers);
-      throw failure(agent, error);
+      if (
+        agent === "coach" &&
+        !(parsed.data as { memory?: LearnerMemory }).memory?.facts.length &&
+        /\b(?:last time|previous(?:ly)?|earlier session|compared with before)\b/i.test((output as CoachOutput).message)
+      ) {
+        throw new AgentCallError("agent_failed", false, "The coach referred to history that this session did not receive");
+      }
+      return output;
     }
-    const ms = performance.now() - started;
-    windows = windowsFrom(reply.headers);
-    // a refusal, or a reply cut off or off the schema, is billed too
-    const usd = dollars(reply.message.usage, price);
-    spentUsd += usd;
-
-    const { content, stop_reason } = reply.message;
-    if (stop_reason === "refusal") throw new AgentCallError("agent_failed", false, `Claude declined the ${agent} call`);
-    let output: unknown;
-    try {
-      // thinking blocks may come first; the JSON is in the text block
-      output = spec.output.parse(JSON.parse(content.find((block) => block.type === "text")?.text ?? ""));
-    } catch (error) {
-      const reason = `The ${agent} reply didn't fit its schema (stop reason: ${stop_reason})`;
-      throw new AgentCallError("agent_failed", true, reason, { cause: error });
-    }
-    // CONTRACTS.md section 2, Memory: a message may cite only the facts it was given; the ids it made up are
-    // dropped here and kept on the log row, so a made-up source can never reach the screen
-    let dropped: string[] = [];
-    if (agent === "coach" || agent === "hint_giver") {
-      const verified = verifyCites(output as CoachOutput | HintGiverOutput, (parsed.data as { memory?: LearnerMemory }).memory);
-      output = verified.output;
-      dropped = verified.dropped;
-      if (dropped.length > 0) console.warn(`The ${agent} cited ${dropped.length} fact id(s) it wasn't given (session ${sessionId}): ${dropped.join(", ")}`);
-    }
-    // A lost log row shouldn't cost the learner their turn. It is written before the call returns, so the row is in
-    // when the Turn answers, and Delete my data, which waits for the Turns in flight, never leaves one behind.
-    await log({ session: sessionId, ...(user ? { user } : {}), agent, input: parsed.data, output, ms, usd, ...(dropped.length > 0 ? { dropped } : {}) }).catch((error: unknown) => {
-      console.error("agent_log write failed:", error);
-    });
-    if (
-      agent === "coach" &&
-      !(parsed.data as { memory?: LearnerMemory }).memory?.facts.length &&
-      /\b(?:last time|previous(?:ly)?|earlier session|compared with before)\b/i.test((output as CoachOutput).message)
-    ) {
-      throw new AgentCallError("agent_failed", false, "The coach referred to history that this session did not receive");
-    }
-    return output;
+    throw new AgentCallError("agent_failed", false, `The ${agent} call exhausted its automatic retry`);
   };
 
-  return (sessionId, user) => async (agent, input) => {
-    try {
-      return await call(sessionId, user, agent, input);
-    } catch (error) {
-      console.error(`callAgent (${agent}, session ${sessionId}):`, error);
-      throw error;
-    }
+  return (sessionId, user) => {
+    return async (agent, input) => {
+      try {
+        return await call(sessionId, user, agent, input);
+      } catch (error) {
+        console.error(`callAgent (${agent}, session ${sessionId}):`, error);
+        throw error;
+      }
+    };
   };
 }

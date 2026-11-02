@@ -30,13 +30,14 @@ function project(t: TestContext, { js, hbc, env }: { js: string; hbc?: string; e
   return join(dir, "dist");
 }
 
-type Expected = Partial<Record<"EXPO_PUBLIC_API_URL" | "EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY", string>>;
+type Expected = Partial<Record<"EXPO_PUBLIC_API_URL" | "EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY" | "EXPO_PUBLIC_DEV_KEY", string>>;
 
 /** Runs the script on `dist` as a deploy would, with `env` as the only EXPO_PUBLIC_* values in its environment. */
 function check(dist: string, env: Expected = {}) {
   const childEnv: NodeJS.ProcessEnv = { ...process.env };
   delete childEnv.EXPO_PUBLIC_API_URL;
   delete childEnv.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY;
+  delete childEnv.EXPO_PUBLIC_DEV_KEY;
   const run = spawnSync(process.execPath, [SCRIPT, dist], { encoding: "utf8", env: { ...childEnv, ...env } });
   return { code: run.status, out: run.stdout + run.stderr };
 }
@@ -95,4 +96,54 @@ test("no API URL anywhere, a local one, or an empty dist each fail with the reas
   const nothing = check(join(empty, "dist"), { EXPO_PUBLIC_API_URL: API, EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY: KEY });
   assert.equal(nothing.code, 1);
   assert.match(nothing.out, /no JavaScript under .*run `npx expo export --platform web --clear` first/);
+});
+
+test("a production export rejects the dev key and loopback references without printing the key", (t) => {
+  const devKey = "local-harness-key-for-this-test-only";
+  const dist = project(t, { js: `var u="${API}",k="${KEY}",d="${devKey}",a="http://localhost:18130",b="http://127.0.0.1:18130";` });
+  const { code, out } = check(dist, {
+    EXPO_PUBLIC_API_URL: API,
+    EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY: KEY,
+    EXPO_PUBLIC_DEV_KEY: devKey,
+  });
+  assert.equal(code, 1);
+  assert.match(out, /EXPO_PUBLIC_DEV_KEY is present/);
+  assert.match(out, /localhost endpoint appears/);
+  assert.match(out, /127\.0\.0\.1 endpoint appears/);
+  assert.doesNotMatch(out, new RegExp(devKey));
+});
+
+test("a dev key loaded from the export .env files is also rejected", (t) => {
+  const devKey = "local-harness-key-from-env";
+  const dist = project(t, {
+    js: `var u="${API}",k="${KEY}",d="${devKey}";`,
+    env: { EXPO_PUBLIC_API_URL: API, EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY: KEY, EXPO_PUBLIC_DEV_KEY: devKey },
+  });
+  const { code, out } = check(dist);
+  assert.equal(code, 1);
+  assert.match(out, /EXPO_PUBLIC_DEV_KEY is present/);
+  assert.doesNotMatch(out, new RegExp(devKey));
+});
+
+test("runtime help text that mentions localhost is not mistaken for a local endpoint", (t) => {
+  const dist = project(t, { js: `var u="${API}",k="${KEY}",fallback="hostname:'localhost'",message="localhost/https";` });
+  const { code, out } = check(dist, { EXPO_PUBLIC_API_URL: API, EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY: KEY });
+  assert.equal(code, 0, out);
+});
+
+
+test("Hermes permits only the React Native localhost:8081 fallback", (t) => {
+  const env = { EXPO_PUBLIC_API_URL: API, EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY: KEY };
+  assert.equal(check(project(t, { js: `"${API}" "${KEY}"`, hbc: "http://localhost:8081/" }), env).code, 0);
+  assert.equal(check(project(t, { js: `"${API}" "${KEY}" "http://localhost:8081/"` }), env).code, 1);
+});
+
+test("loopback and emulator URLs, including escaped URLs, fail export checks", (t) => {
+  for (const endpoint of ["http://[::1]:3000/", "http://0.0.0.0:3000/", "http://10.0.2.2:3000/", "http:\\/\\/127.0.0.1:3000/"]) {
+    for (const native of [false, true]) {
+      const dist = project(t, { js: `"${API}" "${KEY}" ${native ? "" : JSON.stringify(endpoint)}`, ...(native ? { hbc: endpoint } : {}) });
+      const result = check(dist, { EXPO_PUBLIC_API_URL: API, EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY: KEY });
+      assert.equal(result.code, 1, `${endpoint}: ${result.out}`);
+    }
+  }
 });

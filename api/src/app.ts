@@ -74,7 +74,17 @@ export function changedMoves(before: Mastery, after: Mastery): MasteryProgress[]
 /** What this process has in flight for each learner (Render runs the API as one), so Delete my data finishes it first:
  * the Turns being answered, their agent_log rows included, and the memory write a result starts, which stops before
  * its next fact once a delete begins (`stop`). The learner's writes that come during the delete wait until it's done. */
-export function learnerWrites() {
+function waitFor<T>(work: Promise<T>, waitMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error(message), { status: 503, expose: true })), waitMs);
+  });
+  return Promise.race([work, deadline]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+export function learnerWrites(waitMs = 30_000) {
   const inFlight = new Map<string, Set<Promise<unknown>>>();
   const stops = new Map<string, AbortController>();
   const erasing = new Map<string, Promise<void>>();
@@ -100,7 +110,9 @@ export function learnerWrites() {
     /** Runs one of the learner's writes once no delete of theirs is under way. From the check to `work` starting
      * nothing is awaited, so a delete can't begin in between unseen. */
     async run<T>(user: string, work: (stop: AbortSignal) => Promise<T>): Promise<T> {
-      while (erasing.has(user)) await erasing.get(user);
+      while (erasing.has(user)) {
+        await waitFor(erasing.get(user)!, waitMs, "A data deletion is still pending; retry this request shortly");
+      }
       let stop = stops.get(user);
       if (!stop) stops.set(user, (stop = new AbortController()));
       return track(user, work(stop.signal));
@@ -108,7 +120,9 @@ export function learnerWrites() {
     /** Runs `work` (the delete) once the learner's writes in flight have settled, the ones they start meanwhile
      * included: a Turn that began before the delete can still start agent calls, and one of them can outlive it. */
     async erase(user: string, work: () => Promise<void>): Promise<void> {
-      while (erasing.has(user)) await erasing.get(user);
+      while (erasing.has(user)) {
+        await waitFor(erasing.get(user)!, waitMs, "A data deletion is still pending; retry Delete my data shortly");
+      }
       stops.get(user)?.abort();
       stops.delete(user);
       const deleting = (async () => {
@@ -118,13 +132,11 @@ export function learnerWrites() {
       const settled = deleting.then(
         () => {},
         () => {},
-      );
-      erasing.set(user, settled);
-      try {
-        await deleting;
-      } finally {
+      ).finally(() => {
         if (erasing.get(user) === settled) erasing.delete(user);
-      }
+      });
+      erasing.set(user, settled);
+      await waitFor(deleting, waitMs, "Deletion is still waiting for an in-flight write; retry shortly");
     },
   };
 }
@@ -158,7 +170,8 @@ export function createApp({ corsOrigins, checkDb, store, advance, callAgentFor, 
   // Render puts one proxy in front of the app; trusting it makes req.ip the caller's address.
   app.set("trust proxy", 1);
   app.use(cors({ origin: corsOrigins }));
-  app.use(express.json({ limit: "64kb" }));
+  // Clients send plain JSON. Reject compressed bodies before creating a decoder (GHSA-27r3-jxmh-p828).
+  app.use(express.json({ limit: "64kb", inflate: false }));
 
   // The Clerk user id from the session token. Without a token, x-dev-user with the right x-dev-key,
   // which devKey turns off in production. A token that doesn't hold up never falls back to the dev headers.
@@ -269,7 +282,8 @@ export function createApp({ corsOrigins, checkDb, store, advance, callAgentFor, 
       res.status(404).json({ error: "No such session" });
       return;
     }
-    res.json({ steps: session.transcript });
+    // Opt in so older clients with strict transcript schemas keep reading their history.
+    res.json({ steps: session.transcript, ...(req.query.material === "1" ? { material: session.material } : {}) });
   });
 
   app.post("/sessions/:id/turns", async (req, res) => {
@@ -394,9 +408,8 @@ export function createApp({ corsOrigins, checkDb, store, advance, callAgentFor, 
     res.json(await who.store.getMastery(who.user));
   });
 
-  // The delete button: the caller's memory scope, then their sessions, their agent logs, and mastery. Memory goes
-  // first: if its purge fails, the request fails and nothing is half deleted; the learner can try again. Both run
-  // once the learner's writes in flight have finished, so none of them can put anything back after the 204.
+  // The delete button: the caller's memory scope, then their sessions, their agent logs, and mastery. Ambiguous fact
+  // writes have bounded retries before purge. The HTTP wait is 30 s; other processes/restarts are not fenced.
   app.delete("/me/data", async (req, res) => {
     const who = await caller(req, res);
     if (!who) return;
@@ -417,7 +430,7 @@ export function createApp({ corsOrigins, checkDb, store, advance, callAgentFor, 
   // whose status and words are memory's) is a service behind the API: a 502 the app offers to retry, and memory's words
   // go to the log only (code review, Oct 28: a key memory refused read as the learner's sign-in failing).
   const onError: ErrorRequestHandler = (error, _req, res, _next) => {
-    const status = error?.expose === true && typeof error.status === "number" && error.status < 500 ? error.status : error instanceof MemoryError ? 502 : 500;
+    const status = error?.expose === true && typeof error.status === "number" && error.status <= 503 ? error.status : error instanceof MemoryError ? 502 : 500;
     if (status >= 500) console.error(error);
     res.status(status).json({ error: status === 502 ? "Memory didn't answer; the cause is in the server logs" : status === 500 ? "Something went wrong; the cause is in the server logs" : String(error.message) });
   };

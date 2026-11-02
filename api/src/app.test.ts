@@ -3,6 +3,7 @@ import { generateKeyPairSync, sign, type KeyObject } from "node:crypto";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { test, type TestContext } from "node:test";
+import { deflateSync, gzipSync } from "node:zlib";
 import {
   AGENTS,
   FACT_DESK_REDIRECT,
@@ -44,6 +45,28 @@ const noDb: AppOptions = {
   memory: null,
 };
 const as = (user: string, key = KEY) => ({ "x-dev-user": user, "x-dev-key": key });
+
+test("a transcript can restore its owner's original material without changing older responses", async (t) => {
+  const url = await start(t, withStore());
+  const first = await (await post(url, { concept: "API", material: "Original notes" })).json();
+  const path = `${url}/sessions/${first.sessionId}/transcript`;
+  assert.equal((await (await fetch(`${path}?material=1`, { headers: as("leo") })).json()).material, "Original notes");
+  assert.equal("material" in await (await fetch(path, { headers: as("leo") })).json(), false);
+  assert.equal((await fetch(`${path}?material=1`, { headers: as("other") })).status, 404);
+});
+
+test("compressed JSON with trailing bytes is rejected before authentication and leaves the API healthy", async (t) => {
+  const url = await start(t, noDb);
+  for (const [encoding, compress] of [["gzip", gzipSync], ["deflate", deflateSync]] as const) {
+    const response = await fetch(`${url}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-encoding": encoding },
+      body: Buffer.concat([compress('{"concept":"API"}'), Buffer.from("trailing")]),
+    });
+    assert.equal(response.status, 415);
+  }
+  assert.equal((await fetch(`${url}/health`)).status, 200);
+});
 
 // The Store contract kept in memory, so the routes can be tested without a database. `logs` are its agent_log rows.
 function memoryStore(): Store & { logs: readonly AgentLogEntry[] } {
@@ -983,7 +1006,12 @@ test("a call that outlives its Turn (the next question asked ahead, when the eva
       }
       return { message: { content: [{ type: "text", text: question }], stop_reason: "end_turn", usage }, headers: new Headers() };
     };
-    const callAgentFor = createCallAgent({ send, model: "claude-opus-5-5", budgetUsd: 10, log: (entry) => store.logAgentCall(entry) });
+    const callAgentFor = createCallAgent({
+      send,
+      model: "claude-opus-5-5",
+      budgetUsd: 10,
+      log: (entry) => store.logAgentCall(entry),
+    });
     const url = await start(t, { ...noDb, store, advance, callAgentFor });
     const first = await toFirstQuestion(url);
     // optionally hold the Turn before its agent calls, so the delete begins before they start
@@ -1147,6 +1175,22 @@ test("learnerWrites: a delete waits for the learner's writes in flight and stops
     /memory answered 503/,
   );
   assert.equal(await writes.run("leo", async () => "written"), "written");
+});
+
+test("learnerWrites: a slow deletion returns an error without releasing its fence", async () => {
+  const writes = learnerWrites(20);
+  const held = Promise.withResolvers<void>();
+  const erased = Promise.withResolvers<void>();
+  const turn = writes.run("leo", () => held.promise);
+  const deleting = writes.erase("leo", async () => erased.resolve()).then(() => null, (error: Error) => error);
+  const later = writes.run("leo", async () => "must not start").then(() => null, (error: Error) => error);
+  const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), 50));
+  const [deletionResult, writeResult] = await Promise.all([Promise.race([deleting, timeout]), Promise.race([later, timeout])]);
+
+  held.resolve();
+  await Promise.all([turn, erased.promise, deleting, later]);
+  assert.ok(deletionResult instanceof Error && deletionResult.name !== "MemoryError" && "status" in deletionResult && deletionResult.status === 503);
+  assert.ok(writeResult instanceof Error && writeResult.name !== "MemoryError" && "status" in writeResult && writeResult.status === 503);
 });
 
 test("a Turn off the contract is never saved: the learner gets the latest Turn again with error set, and the session stays readable", async (t) => {

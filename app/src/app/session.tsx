@@ -171,9 +171,10 @@ function WorkScreen({ turn, state, send, retry, onType, onClose }: WorkProps) {
   const saved = failure && "text" in failure.body ? " Your answer is saved." : "";
   const help = helpOf(entries);
   const hint = guidedHelpOf(entries);
-  const requestHelp = () => { if (!pending && !held && turn.phase === "move") setHintAt(turn.turn); };
+  const answerUncertain = failure?.retryable === true && "text" in failure.body;
+  const requestHelp = () => { if (!answerUncertain && !pending && !held && turn.phase === "move") setHintAt(turn.turn); };
   const hintSheet = (
-    <Sheet open={hintAt === turn.turn && !pending && !held && turn.phase === "move"} onClose={() => setHintAt(null)} label="guided help">
+    <Sheet open={!answerUncertain && hintAt === turn.turn && !pending && !held && turn.phase === "move"} onClose={() => setHintAt(null)} label="guided help">
       <Title>{`Help for ${turn.move ? AREA_LABEL[turn.move] : "this area"}`}</Title>
       <Body>{hint.detail}</Body>
       <Button label={hint.confirm} onPress={() => {
@@ -197,7 +198,7 @@ function WorkScreen({ turn, state, send, retry, onType, onClose }: WorkProps) {
       pending={pending}
       help={help}
       fireflyAfter={wide}
-      onHelp={requestHelp}
+      onHelp={answerUncertain ? undefined : requestHelp}
       onAskLayout={(y) => setPlace((p) => (p.ask === y ? p : { ...p, ask: y }))}
     />
   );
@@ -223,8 +224,10 @@ function WorkScreen({ turn, state, send, retry, onType, onClose }: WorkProps) {
       onNext={held && hold ? () => setPassed(hold.key) : null}
       onSend={send}
       unsent={unsentOf(state)}
-      onType={(move, text) => onType(turn.sessionId, move, text)}
-      restore={failure && !failure.retryable && "text" in failure.body ? failure.body : null}
+      onType={(move, text, edited) => onType(turn.sessionId, move, text, edited)}
+      failed={failure !== null}
+      retryableFailure={failure !== null && failure.retryable && "text" in failure.body}
+      restore={failure && "text" in failure.body ? failure.body : null}
       flush={wide}
     />
   );
@@ -298,7 +301,7 @@ type ConversationProps = {
   pending: boolean;
   help: ReturnType<typeof helpOf>;
   fireflyAfter: boolean;
-  onHelp: () => void;
+  onHelp?: () => void;
   onAskLayout: (y: number) => void;
 };
 

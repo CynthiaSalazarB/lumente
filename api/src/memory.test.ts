@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { MemoryView as MemoryViewSchema, type CallAgent, type Level, type MemoryFact, type Session, type Turn } from "@build-north/agents";
 import {
   MEMORY_READ_MS,
+  MemoryError,
   createLearnerMemory,
   createMemoryApi,
   dateOf,
@@ -263,12 +264,12 @@ test("the Memory sheet's view: each part's chain newest first, the superseded ro
 
 // A stand-in for memory's REST API: every request it saw, and the answers scripted for it
 function fakeMemory(answer: (method: string, path: string, body: unknown) => { status: number; json?: unknown }) {
-  const seen: { method: string; path: string; body: unknown; auth: string | null }[] = [];
+  const seen: { method: string; path: string; body: unknown; auth: string | null; idempotencyKey: string | null }[] = [];
   const send: typeof fetch = async (input, init) => {
     const url = new URL(String(input));
     const headers = new Headers(init?.headers);
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
-    seen.push({ method: init?.method ?? "GET", path: `${url.pathname}${url.search}`, body, auth: headers.get("authorization") });
+    seen.push({ method: init?.method ?? "GET", path: `${url.pathname}${url.search}`, body, auth: headers.get("authorization"), idempotencyKey: headers.get("idempotency-key") });
     const { status, json } = answer(init?.method ?? "GET", `${url.pathname}${url.search}`, body);
     return new Response(json === undefined ? null : JSON.stringify(json), { status, headers: { "content-type": "application/json" } });
   };
@@ -276,7 +277,7 @@ function fakeMemory(answer: (method: string, path: string, body: unknown) => { s
 }
 const signal = () => AbortSignal.timeout(1_000);
 
-test("the REST calls: a triple write with its scope and labels, a history walked page by page, a scope registered once, a purge", async () => {
+test("the REST calls: a triple write with its scope, labels and idempotency key, a history walked page by page, a scope registered once, a purge", async () => {
   const { seen, api } = fakeMemory((method, path) => {
     if (method === "POST" && path.endsWith("/scopes")) return { status: 409, json: { message: "scope exists" } };
     if (method === "POST" && path.endsWith("/facts")) return { status: 200, json: { mode: "triples", sessionId: "sess_m", turnId: "turn_m" } };
@@ -287,7 +288,7 @@ test("the REST calls: a triple write with its scope and labels, a history walked
   });
   await api.registerScope("learner/a1b2c3d4", signal());
   const entity = entityOf("a1b2c3d4", "API");
-  await api.write("learner/a1b2c3d4", ["session=s1", "writer=coach"], [{ entity, key: "gap", value: "Last time on API you guessed 7 and proved 4.", occurred_at: AT }], signal());
+  await api.write("learner/a1b2c3d4", ["session=s1", "writer=coach"], [{ entity, key: "gap", value: "Last time on API you guessed 7 and proved 4.", occurred_at: AT }], signal(), "write-s1-gap");
   assert.deepEqual(await api.history(entity, signal()), [rows[0], rows[1]]);
   assert.equal(await api.forgetScope("learner/a1b2c3d4", signal()), 9);
 
@@ -302,6 +303,7 @@ test("the REST calls: a triple write with its scope and labels, a history walked
     ],
   );
   assert.ok(seen.every((call) => call.auth === "Bearer sp-secret"));
+  assert.equal(seen[1]?.idempotencyKey, "write-s1-gap");
   assert.deepEqual(seen[0]?.body, { path: "learner/a1b2c3d4" });
   // no `text`, no model: the triples go in as they are, scoped to the learner
   assert.deepEqual(seen[1]?.body, {
@@ -323,7 +325,7 @@ test("an entity memory doesn't have is an empty history, a scope never registere
   });
   assert.deepEqual(await api.history(entityOf("a1b2c3d4", "API"), signal()), []);
   assert.equal(await api.forgetScope("learner/nobody", signal()), 0);
-  await assert.rejects(api.write("learner/x", [], [], signal()), { name: "MemoryError", status: 422, message: "memory answered 422: unknown scope node learner/x" });
+  await assert.rejects(api.write("learner/x", [], [], signal(), "write-x"), { name: "MemoryError", status: 422, message: "memory answered 422: unknown scope node learner/x" });
   await assert.rejects(api.registerScope("learner/x", signal()), { status: 500, message: "memory answered 500" });
 });
 
@@ -367,7 +369,7 @@ test("remembering a session registers its learner's scope once, writes one tripl
     },
     async write(scope, labels, triples) {
       calls.push({ method: "write", path: scope, body: { labels, triples } });
-      if (failWrites) throw new Error("memory answered 503");
+      if (failWrites) throw new MemoryError(503, "memory answered 503");
     },
     async history() {
       return [];
@@ -395,7 +397,7 @@ test("remembering a session registers its learner's scope once, writes one tripl
   await memory.remember("user_2leo", { ...finished, result: null });
   assert.equal(calls.filter((c) => c.method === "write").length, 14);
   failWrites = true;
-  await assert.rejects(memory.remember("user_2leo", finished), /7 of 7 memory writes failed: memory answered 503/);
+  await assert.rejects(memory.remember("user_2leo", finished), /memory answered 503/);
   // the purge, and the scope is registered again afterwards
   await memory.purge("user_2leo");
   assert.equal(calls.at(-1)?.method, "forget");
@@ -710,12 +712,58 @@ test("the read before an agent keeps its budget with the session lookup in it: a
   assert.match(warnings[0] ?? "", /memory read skipped after \d+ ms/);
 });
 
-test("a memory write that ran out of time keeps remember going one more write's time, so a delete waiting on it purges after a late apply (code review, Oct 28)", async () => {
+test("transient fact failures stop after three tries per fact and release the learner", async () => {
+  for (const failure of [new MemoryError(503, "unavailable"), new MemoryError(429, "limited"), new TypeError("network")]) {
+    const api = reading({});
+    let attempts = 0;
+    api.write = async () => { attempts++; throw failure; };
+    const memory = createLearnerMemory(api, { salt: "", conceptsOf: allOn("API") });
+    const writes = learnerWrites();
+    await assert.rejects(writes.run("u", stop => memory.remember("u", finished, stop)), /Memory fact writes failed/);
+    assert.ok(attempts > 0 && attempts % 3 === 0);
+    await writes.erase("u", async () => {});
+    assert.equal(await writes.run("u", async () => "available"), "available");
+  }
+});
+
+test("scope registration stops after three attempts", async () => {
+  const api = reading({});
+  let attempts = 0;
+  api.registerScope = async () => { attempts++; throw new MemoryError(503, "unavailable"); };
+  const memory = createLearnerMemory(api, { salt: "", conceptsOf: allOn("API") });
+  await assert.rejects(memory.remember("u", finished), /unavailable/);
+  assert.equal(attempts, 3);
+});
+
+test("one rejected fact does not prevent later facts", async () => {
+  const api = reading({});
+  let attempts = 0;
+  api.write = async () => { if (++attempts === 1) throw new MemoryError(422, "bad fact"); };
+  const memory = createLearnerMemory(api, { salt: "", conceptsOf: allOn("API") });
+  await assert.rejects(memory.remember("u", finished), /bad fact/);
+  assert.ok(attempts > 1);
+});
+
+test("an ambiguous fact ends when deletion stops retries", async () => {
+  const api = reading({});
+  const stop = new AbortController();
+  let attempts = 0;
+  api.write = async () => { attempts++; stop.abort(); throw new TypeError("network"); };
+  const memory = createLearnerMemory(api, { salt: "", conceptsOf: allOn("API") });
+  await assert.rejects(memory.remember("u", finished, stop.signal), /Memory fact writes failed/);
+  assert.equal(attempts, 1);
+});
+
+test("a fact write that timed out as Delete my data began holds the purge one more write's time, so a late apply is purged too (code review, Oct 28)", async () => {
   const events: string[] = [];
   const held: string[] = [];
+  const inFlight = Promise.withResolvers<void>();
+  const timeOut = Promise.withResolvers<void>();
   const api = reading({});
   api.write = async (_scope, _labels, triples) => {
     if (triples[0]!.key !== "gap") return;
+    inFlight.resolve();
+    await timeOut.promise;
     // memory stops answering in time, and applies the write a little later anyway
     setTimeout(() => {
       held.push("gap");
@@ -729,12 +777,14 @@ test("a memory write that ran out of time keeps remember going one more write's 
   };
   const memory = createLearnerMemory(api, { salt: "", conceptsOf: allOn("API"), writeMs: 80 });
   const writes = learnerWrites();
-  const remembering = writes.track("user_2leo", memory.remember("user_2leo", finished).catch((error: Error) => void events.push(`remember failed: ${error.message}`)));
-  await writes.erase("user_2leo", async () => {
+  const remembering = writes.run("user_2leo", (stop) => memory.remember("user_2leo", finished, stop)).catch(() => {});
+  await inFlight.promise;
+  const erasing = writes.erase("user_2leo", async () => {
     await memory.purge("user_2leo");
     events.push("erased");
   });
-  await remembering;
-  assert.deepEqual(events, ["applied late", "remember failed: 1 of 7 memory writes failed: The operation was aborted due to timeout", "purge, 1 held", "erased"]);
+  timeOut.resolve();
+  await Promise.all([remembering, erasing]);
+  assert.deepEqual(events, ["applied late", "purge, 1 held", "erased"]);
   assert.deepEqual(held, []);
 });

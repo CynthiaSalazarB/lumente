@@ -21,6 +21,14 @@ const CLERK_KEY = /^pk_(test|live)_[A-Za-z0-9]+$/;
 const ANY_CLERK_KEY = /pk_(test|live)_[A-Za-z0-9]{20,}/;
 /** A deployed build can't reach these: the export was made with a local .env. */
 const LOCAL_HOST = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|\d+\.\d+\.\d+\.\d+)(:\d+)?$/;
+/** Check URL host literals, not harmless Expo/URL-runtime error text that also mentions "localhost". */
+const LOCAL_ENDPOINTS = [
+  ["localhost", /(?:https?:)?\/\/localhost(?::\d+)?(?:[/?#"'`\x00]|$)/i],
+  ["127.0.0.1", /(?:https?:)?\/\/127\.0\.0\.1(?::\d+)?(?:[/?#"'`\x00]|$)/i],
+  ["[::1]", /(?:https?:)?\/\/\[::1\](?::\d+)?(?:[/?#"'`\x00]|$)/i],
+  ["0.0.0.0", /(?:https?:)?\/\/0\.0\.0\.0(?::\d+)?(?:[/?#"'`\x00]|$)/i],
+  ["10.0.2.2", /(?:https?:)?\/\/10\.0\.2\.2(?::\d+)?(?:[/?#"'`\x00]|$)/i],
+];
 
 /** KEY=value lines of one .env file, as Expo reads them (comments skipped, quotes stripped); {} when it is missing. */
 function readEnvFile(path) {
@@ -40,13 +48,13 @@ function readEnvFile(path) {
 
 /** The two values Expo inlined into the export: the process first, then the .env files in `projectDir`. */
 function expectedFrom(env, projectDir) {
-  const names = ["EXPO_PUBLIC_API_URL", "EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY"];
+  const names = ["EXPO_PUBLIC_API_URL", "EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY", "EXPO_PUBLIC_DEV_KEY"];
   const found = Object.fromEntries(names.map((name) => [name, env[name]?.trim() || undefined]));
   for (const file of ENV_FILES) {
     const values = readEnvFile(join(projectDir, file));
     for (const name of names) found[name] ??= values[name]?.trim() || undefined;
   }
-  return { apiUrl: found.EXPO_PUBLIC_API_URL, clerkKey: found.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY };
+  return { apiUrl: found.EXPO_PUBLIC_API_URL, clerkKey: found.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY, devKey: found.EXPO_PUBLIC_DEV_KEY };
 }
 
 /** Every file under dist/_expo/static/js, whatever the platform. */
@@ -69,7 +77,7 @@ function bundlesIn(dist) {
  * Checks the export in `dist` against the values the environment named. Returns the problems (none means the export is
  * fit to deploy) and what was found where.
  */
-function checkExport(dist, { apiUrl, clerkKey }) {
+function checkExport(dist, { apiUrl, clerkKey, devKey }) {
   const problems = [];
   const found = [];
   let host = null;
@@ -90,9 +98,17 @@ function checkExport(dist, { apiUrl, clerkKey }) {
   }
   let hostIn = null;
   let keyIn = null;
+  let devKeyIn = null;
   for (const path of bundles) {
     const bytes = readFileSync(path);
     const name = relative(dist, path);
+    const source = bytes.toString("latin1");
+    const normalized = source.replace(/\\+\//g, "/");
+    const endpoints = path.endsWith(".hbc") ? normalized.replaceAll("http://localhost:8081/", "") : normalized;
+    for (const [host, pattern] of LOCAL_ENDPOINTS) {
+      if (pattern.test(endpoints)) problems.push(`${host} endpoint appears in ${name}: local-only references must not be in a production export`);
+    }
+    if (devKey && devKeyIn === null && bytes.includes(devKey)) devKeyIn = name;
     if (host && hostIn === null && bytes.includes(host)) hostIn = name;
     if (keyIn === null) {
       // the key Expo was given when it is known, else any publishable key
@@ -103,6 +119,7 @@ function checkExport(dist, { apiUrl, clerkKey }) {
     if (hostIn) found.push(`${host} in ${hostIn}`);
     else problems.push(`${host} is in none of ${bundles.length} bundle files: demo mode, or exported without --clear or without the environment. Don't deploy`);
   }
+  if (devKeyIn) problems.push(`EXPO_PUBLIC_DEV_KEY is present in ${devKeyIn}: it is for the local harness only`);
   if (keyIn) found.push(`${clerkKey ? `the Clerk key ${clerkKey.slice(0, 8)}…` : "a Clerk key"} in ${keyIn}`);
   else problems.push(`${clerkKey ? `the Clerk key ${clerkKey.slice(0, 8)}…` : "no Clerk publishable key (pk_…)"} is in none of ${bundles.length} bundle files: nobody could sign in. Don't deploy`);
   return { ok: problems.length === 0, problems, found };

@@ -24,15 +24,15 @@ const devKey = process.env.NODE_ENV === "production" ? null : process.env.DEV_KE
 // refuses to start instead (advance-stub.ts).
 const agents = agentConfigFromEnv();
 const orchestrator = orchestratorFor(process.env, { claude: agents !== null, database: store !== null });
-const callAgentFor =
-  agents && store
-    ? createCallAgent({
-        ...agents,
-        // one retry, and no learner waits on a call longer than 30 s
-        send: sendWith(new Anthropic({ maxRetries: 1, timeout: 30_000 })),
-        log: (entry) => store.logAgentCall(entry),
-      })
-    : () => callAgentStub;
+const anthropic = agents && store ? new Anthropic({ maxRetries: 0, timeout: 30_000 }) : null;
+const callAgentFor = agents && store && anthropic
+  ? createCallAgent({
+      ...agents,
+      // call-agent owns retries so each paid request gets its own measured cost and agent_log row.
+      send: sendWith(anthropic),
+      log: (entry) => store.logAgentCall(entry),
+    })
+  : () => callAgentStub;
 
 // SurrealDB Agent Memory (#112): off unless AGENT_MEMORY_ENABLED is on. It needs the database too: the Memory
 // sheet counts who read each fact from agent_log, and the facts come from sessions with a result.

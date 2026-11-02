@@ -108,7 +108,11 @@ again at $0 after a restart; the account's own balance, with auto-reload off (#2
 
 [`src/memory.ts`](src/memory.ts) is the API's side of SurrealDB Agent Memory (CONTRACTS.md section 2,
 Memory): what earlier sessions left about a learner, read before the hint giver and the coach, written
-when a session reaches its result, shown by `GET /me/memory` and purged by `DELETE /me/data`. Off by
+when a session reaches its result, shown by `GET /me/memory` and purged by `DELETE /me/data`. Scope registration and
+fact writes get at most three attempts. Fact retries reuse an idempotency key; deletion stops later attempts, and a
+write that timed out waits one more write's time before the purge. Waiting for learner writes has a 30-second HTTP
+deadline (`503`). Late provider commits and cross-process ordering remain
+outside this process-local guarantee. Off by
 default in the code; on in production since Oct 23 at 9:11 PM ET (`DECISIONS.md`, "Agent Memory goes on for
 the testers"): `/health` answers `"memory": "on"`, and the kill switch is `AGENT_MEMORY_ENABLED` set to anything
 else (about a minute, no deploy).

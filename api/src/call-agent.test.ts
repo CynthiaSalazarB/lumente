@@ -117,11 +117,11 @@ test("Claude's errors become agent errors that say whether a retry can help", as
       throw thrown;
     });
     await assert.rejects(callAgent("questioner", context), failsWith(code, retryable), thrown.message);
-    assert.equal(logged.length, 0);
+    assert.equal(logged.length, retryable ? 2 : 1);
   }
 });
 
-test("a refusal fails for good; a reply cut off or off the schema can be retried; neither is logged", async (t) => {
+test("a refusal fails for good; a reply cut off or off the schema can be retried; each is logged", async (t) => {
   t.mock.method(console, "error", () => {});
   const refused = setup(async () => reply([], { stop_reason: "refusal" }));
   await assert.rejects(refused.callAgent("questioner", context), failsWith("agent_failed", false));
@@ -129,7 +129,7 @@ test("a refusal fails for good; a reply cut off or off the schema can be retried
   await assert.rejects(cutOff.callAgent("questioner", context), failsWith("agent_failed", true));
   const offSchema = setup(async () => reply(answer({ question: 5, scaffold: null })));
   await assert.rejects(offSchema.callAgent("questioner", context), failsWith("agent_failed", true));
-  assert.equal(refused.logged.length + cutOff.logged.length + offSchema.logged.length, 0);
+  assert.equal(refused.logged.length + cutOff.logged.length + offSchema.logged.length, 3);
 });
 
 test("a reply that failed still counts against the budget, since it was billed", async (t) => {
@@ -211,6 +211,7 @@ test("every agent's output schema converts to a structured-output format", () =>
 test("Claude calls are off without a key, and a key needs a budget and a model with a price", () => {
   assert.equal(agentConfigFromEnv({}), null);
   const key = { ANTHROPIC_API_KEY: "test-key", AGENT_BUDGET_USD: "30" };
+  for (const budget of ["Infinity", "NaN", "-1", "0"]) assert.throws(() => agentConfigFromEnv({ ...key, AGENT_BUDGET_USD: budget }), /finite positive/);
   assert.deepEqual(agentConfigFromEnv(key), { model: "claude-opus-5-5", budgetUsd: 30 });
   assert.equal(agentConfigFromEnv({ ...key, AGENT_MODEL: "claude-sonnet-5-5" })?.model, "claude-sonnet-5-5");
   assert.throws(() => agentConfigFromEnv({ ANTHROPIC_API_KEY: "test-key" }), /AGENT_BUDGET_USD/);
@@ -241,4 +242,55 @@ test("the coach and the hint giver keep only cites they were given, and a coach 
   const { callAgent: asker, logged: asked } = setup(async () => reply(answer(question)));
   assert.deepEqual(await asker("questioner", context), question);
   assert.equal("dropped" in asked[0]!, false);
+});
+
+
+test("a transport retry logs both attempts without reserving unknown cost", async (t) => {
+  t.mock.method(console, "error", () => {});
+  let sends = 0;
+  const { callAgent, logged } = setup(async params => {
+    assert.equal(params.max_tokens, 16_000);
+    if (++sends <= 2) throw new Anthropic.APIConnectionTimeoutError();
+    return reply(answer(question));
+  }, 0.02);
+  await assert.rejects(callAgent("questioner", context));
+  assert.deepEqual(await callAgent("questioner", context), question);
+  assert.deepEqual(logged.map(x => [x.attempt, x.outcome, x.costStatus, x.usd]), [[1, "failed", "unknown", 0], [2, "failed", "unknown", 0], [1, "success", "measured", 0.014]]);
+});
+
+test("logging failure cannot prevent a provider send or discard its reply", async (t) => {
+  t.mock.method(console, "error", () => {});
+  let sends = 0;
+  const call = createCallAgent({ model: "claude-opus-5-5", budgetUsd: 10, send: async () => { sends++; return reply(answer(question)); }, log: async () => { throw new Error("database down"); } })("s");
+  assert.deepEqual(await call("questioner", context), question);
+  assert.equal(sends, 1);
+});
+
+test("malformed usage stays finite and does not poison the measured budget", async (t) => {
+  t.mock.method(console, "error", () => {});
+  let sends = 0;
+  const { callAgent, logged } = setup(async () => {
+    const result = reply(answer(question));
+    if (++sends === 1) result.message.usage = { ...usage, input_tokens: NaN };
+    return result;
+  }, 0.01);
+  await callAgent("questioner", context);
+  await callAgent("questioner", context);
+  await assert.rejects(callAgent("questioner", context), failsWith("rate_limited", false));
+  assert.equal(logged[0]?.costStatus, "unknown");
+  assert.ok(logged.every(x => Number.isFinite(x.usd)));
+});
+
+test("retry-after is capped at 60 seconds", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const delays: number[] = [];
+  const timer = globalThis.setTimeout;
+  t.mock.method(globalThis, "setTimeout", ((callback: (...args: unknown[]) => void, ms?: number) => { delays.push(ms ?? 0); return timer(callback, 0); }) as typeof setTimeout);
+  let sends = 0;
+  const { callAgent } = setup(async () => {
+    if (++sends === 1) throw Anthropic.APIError.generate(529, {}, "busy", new Headers({ "retry-after": "99999" }));
+    return reply(answer(question));
+  });
+  await callAgent("questioner", context);
+  assert.deepEqual(delays, [60_000]);
 });

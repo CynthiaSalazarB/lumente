@@ -70,10 +70,10 @@ rejects both when `NODE_ENV=production` or when no `DEV_KEY` is set. Every route
 | `POST` | `/sessions/:id/turns` | one of `{ prediction }`, `{ text }`, `{ question }`, `{ mentefacto }`, `{ action: "help" }`, `{ action: "continue" }` | `Turn` |
 | `GET` | `/sessions` | | `{ sessions: SessionSummary[] }`: the caller's sessions that have a Turn, newest first (`id`, `concept`, `mode`, `createdAt`, `finished`, and `score` and `predictedScore` once the result is in; the schema is in `agents/src/contracts.ts`). Start lists the unfinished ones to pick up and the finished ones under "Your maps", each opened through `GET /sessions/:id` |
 | `GET` | `/sessions/:id` | | latest `Turn`: Resume on Start reads it after a reload or a killed app (#137). `404` for a session that isn't the caller's |
-| `GET` | `/sessions/:id/transcript` | | `{ steps: TranscriptStep[] }`: every saved step, oldest first, each the body the learner sent (`null` for the start) and the `Turn` it got. The app replays them so a session picked up again, or a map opened again, shows its whole conversation. Empty for a session saved before Oct 25 (the app then shows the latest `Turn` alone). `404` for a session that isn't the caller's |
+| `GET` | `/sessions/:id/transcript` | | `{ steps: TranscriptStep[], material?: string \| null }`: every saved step, oldest first, each the body the learner sent (`null` for the start) and the `Turn` it got. The app replays them so a session picked up again, or a map opened again, shows its whole conversation. `?material=1` also includes the session's original notes for recovery. Empty for a session saved before Oct 25 (the app then shows the latest `Turn` alone). `404` for a session that isn't the caller's |
 | `GET` | `/me/mastery` | | `Mastery` |
 | `GET` | `/me/memory` | | `MemoryView` (the Memory sheet; see [Memory](#memory-what-earlier-sessions-left)) |
-| `DELETE` | `/me/data` | | `204`, deletes sessions, logs (by their session or their learner) and mastery, and purges the learner's memory, with the memory flag off too when memory is set up (the delete button); `502` when memory refuses the purge, and nothing is deleted |
+| `DELETE` | `/me/data` | | `204`, deletes sessions, logs (by their session or their learner) and mastery, and purges the learner's memory, with the memory flag off too when memory is set up (the delete button); `502` if memory refuses; `503` if a tracked write does not settle within 30 s |
 | `GET` | `/health` | | `{ ok: true, commit, memory }`: the running commit (7 characters, `null` locally) and `"on"` or `"off"` for Agent Memory (#143). Never touches the database, and the rate limit skips it |
 | `GET` | `/health/db` | | `{ ok: true, ... }` with SurrealDB's clock and the milliseconds it took (read-only); `503` when the database is not configured or does not answer. An ops check, not part of the app contract |
 
@@ -93,6 +93,11 @@ Every `/turns` body also carries `turn`: the number of the `Turn` it answers. If
 older than the session's latest, the API returns the latest `Turn` as it is and doesn't call
 `advance` again, so an answer resent after a timeout is judged once. The app disables Send while a
 call is pending.
+
+The app uses one 90-second deadline over token lookup, headers and body. An uncertain request is retried manually
+with "Try again". Pending text is saved with its Turn number and restored only while the server still expects that Turn.
+Each Claude API call gets at most one automatic transport retry, with SDK retries disabled. Each completed attempt
+writes an `agent_log` row; measured cost counts against the process-local budget. Unknown cost is marked without a reservation.
 
 A body the latest `Turn` doesn't ask for gets `409` with the latest `Turn`, and `advance` isn't
 called: a `turn` newer than the latest, a body other than the one `expects` names, Help before the
@@ -527,21 +532,21 @@ with `error` set. What `callAgent` throws carries `code` and `retryable`, the tw
 |---|---|---|
 | `mastery` | user, move, level, unassistedSuccesses, updatedAt | one row per user per move; read every turn |
 | `session` | id, user, concept, material, mode, turn, lastTurn, predictedScore, firstAttempt, phase, move, hintStep, hintsPerMove, mentefacto, recent, retries, lastIssue, nextQuestion, questions, moveLog, result, transcript, createdAt | the orchestrator's state; `lastTurn` is returned again on a repeat; `hintsPerMove` starts with all four moves at 0, `retries` at 0, `lastIssue` at `"none"`, `nextQuestion` at null. `transcript` is the API's, not the orchestrator's: one `{ body, turn }` per saved Turn, appended in the same conditional write as the Turn, never for an error Turn, a resend or a 409; `[]` on sessions saved before Oct 25 |
-| `agent_log` | session, user?, agent, input, output, ms, usd, at, dropped? | append-only; debugging, the testers' numbers (fact desk rows are the questions metric) and what a session costs. `user` (since Oct 28) names the learner the call was for, so Delete my data finds a row whose session is gone; older rows go by their session. `dropped` is on a coach or hint giver row whose output cited a fact id the API hadn't passed in (CONTRACTS.md, Memory) |
+| `agent_log` | session, user?, agent, input, output, ms, usd, at, dropped?, callId?, attempt?, outcome?, costStatus?, status? | append-only; debugging, the testers' numbers (fact desk rows are the questions metric) and what a session costs. `user` (since Oct 28) names the learner the call was for, so Delete my data finds a row whose session is gone; older rows go by their session. `dropped` is on a coach or hint giver row whose output cited a fact id the API hadn't passed in (CONTRACTS.md, Memory) |
 
 With the memory flag on, SurrealDB Agent Memory keeps one scope per learner (a salted hash of the Clerk
 id) holding the facts in [Memory](#memory-what-earlier-sessions-left): each with its source, the agent that
 wrote it, the fact it superseded and who read it. It's a copy for the agents and the Memory sheet; the
 tables above stay the record.
 
-`DELETE /me/data` purges the user's memory scope first (`POST /scopes/forget`, a hard delete), then removes all three tables' rows
-(`agent_log` by `session.user` or `user`).
-Both wait for the user's writes in flight in the API process (a Turn being answered, with its `agent_log` rows; the
-memory write a result started, which stops before its next fact, and after a write memory stopped answering in time
-waits one more write's time, since memory may still apply it), and the user's writes that arrive meanwhile wait for
-the delete, so nothing comes back after the 204.
+`DELETE /me/data` waits for tracked learner writes, purges the scope, then removes sessions, logs and mastery.
+Scope registration and each fact get at most three attempts; deletion stops later attempts and facts. Fact retries reuse
+an idempotency key derived from the exact body. Failed facts are reported together after remaining facts are tried.
+The HTTP wait for tracked writes is 30 seconds; expiry is a plain `503`, while provider Memory errors are `502`.
+The process-local fence remains until tracked work settles. It does not survive restart or coordinate multiple processes.
+A fact write memory stopped answering in time may still be applied, so the write waits one more write's time before the
+purge; provider write/forget ordering is still not guaranteed.
 
----
 
 ## 5. Notes for the API
 
