@@ -189,8 +189,10 @@ export const SavedTurnBody = z.union([
  */
 export const TranscriptStep = z.strictObject({ body: SavedTurnBody.nullable(), turn: Turn });
 export type TranscriptStep = z.infer<typeof TranscriptStep>;
-/** What GET /sessions/:id/transcript answers: every saved step, oldest first. Empty for a session saved before Oct 25. */
-export const Transcript = z.strictObject({ steps: z.array(TranscriptStep) });
+/** What GET /sessions/:id/transcript answers: every saved step, oldest first; `?material=1` also opts in to the original
+ * notes. Empty for a session saved before Oct 25. */
+export const Transcript = z.strictObject({ steps: z.array(TranscriptStep), material: z.string().nullable().optional() });
+export type Transcript = z.infer<typeof Transcript>;
 
 export const Mastery = z.strictObject({
   moves: z.array(

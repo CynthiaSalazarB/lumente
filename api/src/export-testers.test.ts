@@ -6,6 +6,13 @@ import { initialSession } from "./store.ts";
 
 let made = 0;
 
+test("CSV keeps formula-like concepts as text, including leading whitespace", () => {
+  for (const [concept, expected] of [["=1+1", "'=1+1"], ["+1+1", "'+1+1"], ["-1+1", "'-1+1"], ["@SUM(1)", "'@SUM(1)"], ["\t=1+1", "'\t=1+1"], ["\r=1+1", '"\'\r=1+1"'], ["  =1+1", "'  =1+1"]] as const) {
+    const { rows } = sheetOf([finished("u", concept, "2026-10-28T12:00:00Z")], "");
+    assert.ok(toCsv(rows).includes(`L1,pre,${expected},6,`));
+  }
+});
+
 /** A finished test session, as the store returns it (ids as SurrealDB makes them: no user in them). */
 function finished(user: string, concept: string, createdAt: string, over: { score?: number; predicted?: number; rubric?: number[]; hints?: number; asked?: number; testing?: number; mode?: "learn" | "test" } = {}): Session {
   const rubric = over.rubric ?? [2, 1, 0, 2];

@@ -1,4 +1,4 @@
-import { ClerkProvider, useAuth } from "@clerk/expo";
+import { ClerkProvider, useAuth, useSession as useClerkSession } from "@clerk/expo";
 import { tokenCache } from "@clerk/expo/token-cache";
 import { AtkinsonHyperlegibleMono_400Regular, AtkinsonHyperlegibleMono_600SemiBold } from "@expo-google-fonts/atkinson-hyperlegible-mono";
 import { AtkinsonHyperlegibleNext_400Regular, AtkinsonHyperlegibleNext_600SemiBold } from "@expo-google-fonts/atkinson-hyperlegible-next";
@@ -105,8 +105,10 @@ function RootLayout() {
 
 // #22: every API call carries the Clerk session token, and a signed-out learner only sees sign-in.
 function ClerkApp() {
-  const { isLoaded, isSignedIn, userId, getToken } = useAuth();
-  const client = useMemo(() => createClient(() => getToken()), [getToken]);
+  const { isLoaded, isSignedIn, userId } = useAuth();
+  const { session } = useClerkSession();
+  // Bind credentials to the same session as persisted intents, even after an account switch.
+  const client = useMemo(() => createClient(session ? () => session.getToken() : async () => null, session?.user.id), [session]);
   // nothing to show until Clerk knows whether someone is signed in
   if (!isLoaded) return null;
   // Expiry and account switching can bypass our Sign out button; no previous learner's UI survives an identity change.

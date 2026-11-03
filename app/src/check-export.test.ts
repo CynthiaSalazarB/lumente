@@ -14,6 +14,21 @@ const SCRIPT = fileURLToPath(new URL("../scripts/check-export.mjs", import.meta.
 const API = "https://api.example.test";
 const KEY = "pk_test_Zm9yLWxvY2FsLXRlc3RzLW9ubHk";
 
+test("a padded Clerk publishable key remains valid for an export", (t) => {
+  const key = `pk_test_${Buffer.from("example.clerk.accounts.dev$").toString("base64")}`;
+  const dist = project(t, { js: `${API} ${key}` });
+  const result = check(dist, { EXPO_PUBLIC_API_URL: API, EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY: key });
+  assert.equal(result.code, 0, result.out);
+});
+
+test("deployment rejects unsupported schemes, plaintext, and local hostname variants", (t) => {
+  for (const url of ["ftp://api.example.test", "http://api.example.test", "https://localhost.:3000", "https://127.1:3000", "https://[::1]:3000", "https://user:pass@api.example.test"]) {
+    const dist = project(t, { js: `${url} ${new URL(url).host} ${KEY}` });
+    const result = check(dist, { EXPO_PUBLIC_API_URL: url, EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY: KEY });
+    assert.equal(result.code, 1, url);
+  }
+});
+
 /** A project folder with one web chunk holding `js`, an optional Android bundle, and an optional .env file. */
 function project(t: TestContext, { js, hbc, env }: { js: string; hbc?: string; env?: Record<string, string> }) {
   const dir = mkdtempSync(join(tmpdir(), "lumente-export-"));

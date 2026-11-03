@@ -1,4 +1,5 @@
 import { Surreal } from "surrealdb";
+import { validateServiceUrl } from "./service-url.ts";
 
 type AuthLevel = "root" | "namespace" | "database";
 
@@ -30,7 +31,7 @@ function isAuthLevel(level: string): level is AuthLevel {
 export function surrealConfigFromEnv(env: NodeJS.ProcessEnv = process.env): SurrealConfig | null {
   const url = env.SURREAL_URL;
   if (!url) return null;
-  if (!URL.canParse(url)) throw new Error("SURREAL_URL is not a URL (expected wss://<instance>.surreal.cloud)");
+  validateServiceUrl(url, "SURREAL_URL", env, true);
   const { SURREAL_NAMESPACE: namespace, SURREAL_DATABASE: database, SURREAL_USER: username, SURREAL_PASS: password } = env;
   if (!namespace || !database || !username || !password) {
     throw new Error("SURREAL_URL is set, so SURREAL_NAMESPACE, SURREAL_DATABASE, SURREAL_USER and SURREAL_PASS are required");
@@ -40,10 +41,9 @@ export function surrealConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Surr
   return { url, namespace, database, username, password, authLevel };
 }
 
-// Connects now and never gives up: after a drop the SDK reconnects forever (at most 5 s apart), so a
-// database blip can't leave the API without a connection until the next deploy. Queries wait for the
-// connection, bounded by their own timeout.
-export function connectSurreal({ url, namespace, database, username, password, authLevel }: SurrealConfig): Surreal {
+// Startup waits up to 5 s for authentication. After a successful start the SDK reconnects after drops
+// (at most 5 s apart); each query has its own deadline while the connection recovers.
+export async function connectSurreal({ url, namespace, database, username, password, authLevel }: SurrealConfig): Promise<Surreal> {
   // The level the user was created at: the signin has to name the same namespace and database.
   const authentication =
     authLevel === "root" ? { username, password }
@@ -53,10 +53,21 @@ export function connectSurreal({ url, namespace, database, username, password, a
   db.subscribe("connected", (version) => console.log(`SurrealDB connected (${version})`));
   db.subscribe("disconnected", () => console.warn("SurrealDB disconnected"));
   db.subscribe("error", (error) => console.error("SurrealDB connection error:", error));
-  db.connect(url, { namespace, database, authentication, reconnect: { attempts: -1, retryDelayMax: 5_000 } }).catch(
-    (error: unknown) => console.error("SurrealDB connect failed:", error),
-  );
-  return db;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      db.connect(url, { namespace, database, authentication, reconnect: { attempts: -1, retryDelayMax: 5_000 } }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("SurrealDB connection timed out after 5 seconds")), QUERY_TIMEOUT_MS);
+      }),
+    ]);
+    return db;
+  } catch (error) {
+    await db.close();
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // Read-only: asks the database for its clock, so a public URL can't be used to write to it.

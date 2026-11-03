@@ -3,12 +3,37 @@ title: "Status, Oct 22 night: what is live, what is open, and who holds it"
 type: context
 related: ["[[plan-to-win]]", "[[expo-prize-plan]]", "[[hosting-setup]]"]
 created: 2026-10-22
-updated: 2026-10-28
+updated: 2026-11-02
 ---
 
-Where Leo's side stands, started late on Oct 22 and kept current since (the latest rows are Oct 28: start with
+Where Leo's side stands, started late on Oct 22 and kept current since (the latest rows are Nov 2: start with
 the next section), written for the next session that opens this repo (Cynthia's Claude included). Numbers and
 links only; no secrets, no tester names. Every item names who holds it.
+
+## Nov 2: the `summary` branch, audited, fixed, waiting for Cynthia (#207)
+
+Leo's side; Cynthia reviews and merges. [#207](https://github.com/CynthiaSalazarB/lumente/pull/207) is Codex's
+consolidated bug-fix loop (Oct 29) plus every finding of Codex's Nov 2 audit and of the checks after it, fixed and
+tested. Nothing is merged or deployed. The PR description has the detail, and `docs/summary-bug-ledger.md` has each
+fix's reproduction and proof.
+
+- **The audit:** two regressions in the branch, both fixed (a Turn refused for good after two failed attempts; the
+  tester export exiting 1 on the lease fields a Turn leaves), and seven defects on `main` that the branch fixes
+  (compressed bodies before sign-in, a pending answer lost on reload, whole-map typing unsaved, the token lookup
+  outside the deadline, drafts pruned beyond the 200-row list, CSV formulas, paid bad replies missing from
+  `agent_log`).
+- **Found after it, also fixed:** three timing-sensitive tests, the lockfile's `libc` fields (dropped by Windows
+  npm), and new required `agent_log` fields that made the live release lose its rows during a deploy.
+- **Checked:** app 140, api 154 (SurrealDB 3.3.2), agents 125, twice; tsc clean; mutation runs; the audit's
+  probes; the browser recovery harness at 390 px; Linux `npm ci`.
+- **Before merging** (a merge deploys the API): startup now requires `CLERK_JWT_KEY`, a `wss://` `SURREAL_URL`,
+  an `https://` memory endpoint and a finite `AGENT_BUDGET_USD`. Leo's notes say Render has them; the variables
+  weren't checked live. A rollback to `main` first needs `UPDATE session UNSET activeTurnClaim,
+  activeTurnClaimUntil, turnClaimFor, turnClaimAttempts;`.
+- **Cynthia's calls:** the Android fingerprint changes (`56eeb40f…` to `fdc7c608…`, from the Expo SDK 58 patch
+  updates), so the app fixes need a new Android build, or the dependency updates move to their own PR and the fixes
+  ship to build 3 as a JavaScript update; the three new DECISIONS.md entries and the CONTRACTS.md changes are hers to
+  accept with the merge.
 
 ## Oct 27 to 28: two code reviews, fixed, tested and shipped
 

@@ -168,7 +168,7 @@ function WorkScreen({ turn, state, send, retry, onType, onClose }: WorkProps) {
   }, [lit, turn.turn]);
 
   const { failure } = state;
-  const saved = failure && "text" in failure.body ? " Your answer is saved." : "";
+  const saved = failure && "text" in failure.body ? " Your answer is back in the field." : "";
   const help = helpOf(entries);
   const hint = guidedHelpOf(entries);
   const requestHelp = () => { if (!pending && !held && turn.phase === "move") setHintAt(turn.turn); };
@@ -223,8 +223,10 @@ function WorkScreen({ turn, state, send, retry, onType, onClose }: WorkProps) {
       onNext={held && hold ? () => setPassed(hold.key) : null}
       onSend={send}
       unsent={unsentOf(state)}
-      onType={(move, text) => onType(turn.sessionId, move, text)}
-      restore={failure && !failure.retryable && "text" in failure.body ? failure.body : null}
+      onType={(move, text, edited) => onType(turn.sessionId, move, text, edited)}
+      failed={failure !== null}
+      retryableFailure={failure !== null && failure.retryable && "text" in failure.body}
+      restore={failure && "text" in failure.body ? failure.body : null}
       flush={wide}
     />
   );

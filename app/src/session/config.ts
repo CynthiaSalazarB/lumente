@@ -3,6 +3,7 @@
 import { createApiClient } from "./api-client.ts";
 import type { SessionClient } from "./client.ts";
 import { createFixtureClient } from "./fixture-client.ts";
+import { withPendingStarts } from "./pending-start.ts";
 
 const apiUrl = process.env.EXPO_PUBLIC_API_URL;
 
@@ -23,6 +24,10 @@ export function clientFor(apiUrl: string | undefined, getToken?: () => Promise<s
 }
 
 /** With Clerk, `getToken` gives every API call the signed-in learner's session token instead. */
-export function createClient(getToken?: () => Promise<string | null>): SessionClient {
-  return clientFor(apiUrl, getToken);
+export function createClient(getToken?: () => Promise<string | null>, userId?: string | null): SessionClient {
+  const client = clientFor(apiUrl, getToken);
+  const identity = getToken ? userId : devUser;
+  if (client.offline || !identity) return client;
+  const scope = JSON.stringify([apiUrl!.trim().replace(/\/+$/, ""), getToken ? "clerk" : "dev", identity]);
+  return withPendingStarts(client, scope, async () => (await import("./pending-start-storage.ts")).pendingStartStorage);
 }

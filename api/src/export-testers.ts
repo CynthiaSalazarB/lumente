@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import { writeFile } from "node:fs/promises";
-import { MOVE_ORDER, Session, type MoveId } from "@build-north/agents";
+import { MOVE_ORDER, type MoveId, type Session } from "@build-north/agents";
+import type { Surreal } from "surrealdb";
 import { connectSurreal, queryTimeout, surrealConfigFromEnv } from "./db.ts";
+import { sessionRecord } from "./store.ts";
 
 // The testers' numbers (#50): every finished test session (the pre-test and the post-test of each
 // tester, docs/tester-protocol.md), as rows of docs/grading-sheet.csv, so Cynthia pastes them in and
@@ -94,7 +96,22 @@ export function sheetOf(sessions: readonly Session[], salt: string): { rows: She
   return { rows, maps };
 }
 
-const cell = (value: string) => (/[",\n]/.test(value) ? `"${value.replaceAll('"', '""')}"` : value);
+const cell = (value: string) => {
+  // CSV quoting alone doesn't stop a spreadsheet from evaluating learner-controlled text.
+  const text = /^[\s\u0000-\u001f]*[=+@-]|^[\t\r\n]/.test(value) ? `'${value}` : value;
+  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+};
+
+/** Every finished test session in the database, oldest first. Rows go through the store's conversion, which drops the
+ * API's Turn lease fields: the strict Session schema refused them and stopped the whole export (audit, Nov 2). */
+export async function finishedTestSessions(db: Surreal): Promise<Session[]> {
+  const [rows] = await db
+    .query('SELECT *, record::id(id) AS id FROM session WHERE mode = "test" AND result != NONE ORDER BY createdAt')
+    .json()
+    .signal(queryTimeout())
+    .collect<[Record<string, unknown>[]]>();
+  return rows.map(sessionRecord);
+}
 
 /** The sheet as CSV text, header first, one line per row, in the sheet's column order. */
 export function toCsv(rows: readonly SheetRow[]): string {
@@ -111,15 +128,9 @@ async function main(out: string): Promise<number> {
     console.error("SURREAL_URL is unset: set the SURREAL_* variables for the database to export from");
     return 2;
   }
-  const db = connectSurreal(config);
+  const db = await connectSurreal(config);
   try {
-    const [rows] = await db
-      .query('SELECT *, record::id(id) AS id FROM session WHERE mode = "test" AND result != NONE ORDER BY createdAt')
-      .json()
-      .signal(queryTimeout())
-      .collect<[unknown[]]>();
-    const sessions = rows.map((row) => Session.parse(row));
-    const { rows: sheet, maps } = sheetOf(sessions, process.env.LEARNER_ID_SALT ?? "");
+    const { rows: sheet, maps } = sheetOf(await finishedTestSessions(db), process.env.LEARNER_ID_SALT ?? "");
     const mapsPath = out.replace(/\.csv$/i, "") + ".maps.json";
     await writeFile(out, toCsv(sheet), "utf8");
     await writeFile(mapsPath, `${JSON.stringify(maps, null, 2)}\n`, "utf8");

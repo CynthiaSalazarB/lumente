@@ -17,6 +17,10 @@ DEFINE TABLE IF NOT EXISTS session SCHEMALESS;
 DEFINE FIELD OVERWRITE user ON session TYPE string;
 DEFINE FIELD OVERWRITE mode ON session TYPE "learn" | "test";
 DEFINE FIELD OVERWRITE turn ON session TYPE int;
+DEFINE FIELD OVERWRITE activeTurnClaim ON session TYPE option<string>;
+DEFINE FIELD OVERWRITE activeTurnClaimUntil ON session TYPE option<datetime>;
+DEFINE FIELD OVERWRITE turnClaimFor ON session TYPE option<int>;
+DEFINE FIELD OVERWRITE turnClaimAttempts ON session TYPE option<int>;
 DEFINE FIELD OVERWRITE createdAt ON session TYPE datetime DEFAULT time::now() READONLY;
 DEFINE INDEX OVERWRITE session_user ON session FIELDS user;
 
@@ -33,8 +37,15 @@ DEFINE FIELD OVERWRITE session ON agent_log TYPE record<session>;
 DEFINE FIELD OVERWRITE agent ON agent_log TYPE string;
 DEFINE FIELD OVERWRITE ms ON agent_log TYPE int;
 DEFINE FIELD OVERWRITE usd ON agent_log TYPE number;
+-- Optional: the release before them writes none, while it still serves during a deploy and after a rollback.
+DEFINE FIELD OVERWRITE callId ON agent_log TYPE option<string>;
+DEFINE FIELD OVERWRITE attempt ON agent_log TYPE option<int> ASSERT $value = NONE OR $value >= 1;
+DEFINE FIELD OVERWRITE outcome ON agent_log TYPE option<"started" | "success" | "failed">;
+DEFINE FIELD OVERWRITE costStatus ON agent_log TYPE option<"measured" | "reserved" | "not_charged">;
 DEFINE FIELD OVERWRITE at ON agent_log TYPE datetime DEFAULT time::now() READONLY;
 DEFINE FIELD OVERWRITE user ON agent_log TYPE option<string>;
+DEFINE FIELD OVERWRITE turn ON agent_log TYPE option<int>;
+DEFINE FIELD OVERWRITE turnAttempt ON agent_log TYPE option<int>;
 DEFINE INDEX OVERWRITE agent_log_session ON agent_log FIELDS session;
 DEFINE INDEX OVERWRITE agent_log_user ON agent_log FIELDS user;
 `;
@@ -42,26 +53,56 @@ DEFINE INDEX OVERWRITE agent_log_user ON agent_log FIELDS user;
 /** `dropped`: on a coach or hint giver row, the fact ids its output cited that the API hadn't passed in (CONTRACTS.md, Memory).
  * `user`: the learner the call was for, so Delete my data finds the row even after its session is gone (rows from
  * before Oct 28 have none, and go by their session). */
-export type AgentLogEntry = { session: string; user?: string; agent: string; input: unknown; output: unknown; ms: number; usd: number; dropped?: string[] };
+export type AgentLogEntry = {
+  session: string;
+  user?: string;
+  agent: string;
+  input: unknown;
+  output: unknown;
+  ms: number;
+  usd: number;
+  callId: string;
+  attempt: number;
+  turn?: number;
+  turnAttempt?: number;
+  outcome: "started" | "success" | "failed";
+  costStatus: "measured" | "reserved" | "not_charged";
+  status?: number;
+  dropped?: string[];
+};
 
 /** A move a Turn moved on: the level it reached and the unassisted successes it added (`changedMoves` in app.ts). */
 export type MasteryProgress = { move: MoveId; level: Level; gained: number };
+export type TurnClaimState = { active: boolean };
 
 export type Store = {
+  // Persist an already initialized session in one write; no invisible intermediate row.
+  insertSession(session: Session): Promise<void>;
   createSession(user: string, input: NewSession): Promise<Session>;
   // null when the session doesn't exist or belongs to someone else
   getSession(user: string, id: string): Promise<Session | null>;
   // GET /sessions: the user's sessions that have a Turn, newest first
   listSessions(user: string): Promise<SessionSummary[]>;
-  // false when the stored session is no longer at `previousTurn`: another request answered it first. In the same
+  // false when the stored session is no longer at `previousTurn` or the supplied lease was replaced. In the same
   // transaction, and only when the session is saved, `progress` goes onto the session user's mastery as it is stored
   // then: a level never drops below the stored one and successes add to the stored count, so a Turn that read mastery
   // before another session saved can't undo that session's progress, and no session moves on without what it earned.
-  saveSession(session: Session, previousTurn: number, progress?: readonly MasteryProgress[]): Promise<boolean>;
+  saveSession(session: Session, previousTurn: number, progress?: readonly MasteryProgress[], claimId?: string): Promise<boolean>;
+  // A database-backed lease admits one handler, as attempt 1 of the Turn. A `recovery` claim, from a request that waited
+  // behind that handler, takes over a lease it left unsaved once (attempt 2): duplicates of one send can't keep re-running
+  // a failing Turn, and the learner's next send starts again at attempt 1 (audit, Nov 2).
+  claimTurn(user: string, sessionId: string, turn: number, claimId: string, recovery?: boolean): Promise<number | null>;
+  turnClaimState(user: string, sessionId: string, turn: number): Promise<TurnClaimState | null>;
+  releaseTurn(user: string, sessionId: string, claimId: string): Promise<void>;
+  renewTurnClaim(user: string, sessionId: string, turn: number, claimId: string): Promise<boolean>;
   // every move, in session order; a move the learner hasn't touched yet is at level 1
   getMastery(user: string): Promise<Mastery>;
   // the moves given, one row each, as they are (the demo seed); moves left out keep their rows
   saveMastery(user: string, mastery: Mastery): Promise<void>;
+  // Create the reserved row before the provider call; an unsettled row remains a conservative record after a crash.
+  beginAgentCall(entry: AgentLogEntry): Promise<string>;
+  // Finalize the same row after usage or failure is known. On failure, the original reservation remains.
+  finishAgentCall(id: string, entry: AgentLogEntry): Promise<void>;
   logAgentCall(entry: AgentLogEntry): Promise<void>;
   // GET /me/memory: the concepts of the user's finished sessions, newest first, each once
   finishedConcepts(user: string): Promise<string[]>;
@@ -115,6 +156,14 @@ const SET_SESSION = Object.keys(Session.shape)
   .map((key) => `${key} = $s.${key}`)
   .join(", ");
 
+// export-testers.ts reads its rows through this too.
+export function sessionRecord(row: Record<string, unknown>) {
+  const session = { ...row };
+  // Durable lease metadata belongs to the API store, not the strict learner-session contract.
+  for (const field of ["activeTurnClaim", "activeTurnClaimUntil", "turnClaimFor", "turnClaimAttempts"]) delete session[field];
+  return Session.parse(session);
+}
+
 export function createStore(db: Surreal): Store {
   // Runs one statement and returns its result as plain JSON (dates as ISO strings).
   async function one<T>(sql: string, bindings: Record<string, unknown>): Promise<T> {
@@ -122,10 +171,18 @@ export function createStore(db: Surreal): Store {
     return result as T;
   }
   const sessionId = (id: string) => new RecordId("session", id);
+  const agentLogId = (id: string) => new RecordId("agent_log", id);
 
   // Rows go through the agents schemas on the way out, so a database that drifted from the contract
   // fails here instead of somewhere downstream.
   return {
+    async insertSession(session) {
+      const { id, createdAt: _createdAt, ...content } = Session.parse(session);
+      if (!session.lastTurn || session.turn !== session.lastTurn.turn || session.id !== session.lastTurn.sessionId) {
+        throw new Error("A new session must contain its matching first Turn");
+      }
+      await one("CREATE ONLY $id CONTENT $content", { id: sessionId(id), content });
+    },
     async createSession(user, input) {
       const session = await one("CREATE ONLY session CONTENT $content RETURN *, record::id(id) AS id", {
         content: initialSession(user, input),
@@ -134,11 +191,66 @@ export function createStore(db: Surreal): Store {
     },
 
     async getSession(user, id) {
-      const session = await one("SELECT *, record::id(id) AS id FROM ONLY $id WHERE user = $user", {
+      const session = await one<Record<string, unknown> | null>("SELECT *, record::id(id) AS id FROM ONLY $id WHERE user = $user", {
         id: sessionId(id),
         user,
       });
-      return session ? Session.parse(session) : null;
+      return session ? sessionRecord(session) : null;
+    },
+
+    async claimTurn(user, id, turn, claimId, recovery = false) {
+      const [claimed] = await db
+        .query(
+          `UPDATE $id SET activeTurnClaim = $claimId, activeTurnClaimUntil = time::now() + 2m,
+             turnClaimFor = $turn,
+             turnClaimAttempts = IF $recovery AND turnClaimFor = $turn THEN (turnClaimAttempts ?? 0) + 1 ELSE 1 END
+           WHERE user = $user AND turn = $turn
+             AND (activeTurnClaim = NONE OR activeTurnClaim = NULL OR activeTurnClaimUntil <= time::now())
+             AND ($recovery = false OR turnClaimFor != $turn OR (turnClaimAttempts ?? 0) < 2)
+           RETURN VALUE turnClaimAttempts`,
+          { id: sessionId(id), user, turn, claimId, recovery },
+        )
+        .json()
+        .retry()
+        .signal(queryTimeout())
+        .collect<[number[]]>();
+      return claimed?.[0] ?? null;
+    },
+
+    async turnClaimState(user, id, turn) {
+      const row = await one<{ active?: boolean } | null>(
+        `SELECT (activeTurnClaim != NONE AND activeTurnClaim != NULL AND activeTurnClaimUntil > time::now()) AS active
+         FROM ONLY $id WHERE user = $user AND turn = $turn`,
+        { id: sessionId(id), user, turn },
+      );
+      return row ? { active: row.active === true } : null;
+    },
+
+    async releaseTurn(user, id, claimId) {
+      await db
+        .query(
+          `UPDATE $id SET activeTurnClaim = NONE, activeTurnClaimUntil = NONE
+           WHERE user = $user AND activeTurnClaim = $claimId RETURN NONE`,
+          { id: sessionId(id), user, claimId },
+        )
+        .retry()
+        .signal(queryTimeout())
+        .collect();
+    },
+
+    async renewTurnClaim(user, id, turn, claimId) {
+      const [renewed] = await db
+        .query(
+          `UPDATE $id SET activeTurnClaimUntil = time::now() + 2m
+           WHERE user = $user AND turn = $turn AND activeTurnClaim = $claimId
+           RETURN VALUE activeTurnClaim`,
+          { id: sessionId(id), user, turn, claimId },
+        )
+        .json()
+        .retry()
+        .signal(queryTimeout())
+        .collect<[string[]]>();
+      return renewed?.[0] === claimId;
     },
 
     async listSessions(user) {
@@ -152,14 +264,18 @@ export function createStore(db: Surreal): Store {
       return rows.map((row) => SessionSummary.parse(row));
     },
 
-    async saveSession(session, previousTurn, progress = []) {
+    async saveSession(session, previousTurn, progress = [], claimId) {
       // The WHERE checks and writes in one statement, so two answers to the same Turn can't both move it on, and the
       // mastery the Turn earned is written in the same transaction, so both land or neither does. A conflict with a
       // parallel write (another session's mastery, Delete my data) runs the whole transaction again, which then sees it.
+      const claimWhere = claimId === undefined
+        ? " AND (activeTurnClaim = NONE OR activeTurnClaim = NULL)"
+        : " AND activeTurnClaim = $claimId";
       const [saved] = await db
         .query(
           `BEGIN;
-           LET $saved = (UPDATE $id SET ${SET_SESSION} WHERE turn = $previousTurn RETURN VALUE turn);
+           LET $saved = (UPDATE $id SET ${SET_SESSION}, activeTurnClaim = NONE, activeTurnClaimUntil = NONE
+             WHERE turn = $previousTurn${claimWhere} RETURN VALUE turn);
            IF array::len($saved) > 0 {
              FOR $m IN $progress {
                UPSERT type::record("mastery", [$user, $m.move]) SET user = $user, move = $m.move,
@@ -168,7 +284,7 @@ export function createStore(db: Surreal): Store {
            };
            RETURN array::len($saved) > 0;
            COMMIT;`,
-          { id: sessionId(session.id), previousTurn, s: session, user: session.user, progress },
+          { id: sessionId(session.id), previousTurn, s: session, user: session.user, progress, ...(claimId === undefined ? {} : { claimId }) },
         )
         .json()
         .retry()
@@ -205,9 +321,43 @@ export function createStore(db: Surreal): Store {
       );
     },
 
-    async logAgentCall({ session, user, agent, input, output, ms, usd, dropped }) {
+    async beginAgentCall({ session, user, agent, input, output, ms, usd, callId, attempt, turn, turnAttempt, outcome, costStatus, status, dropped }) {
+      const ids = await one<string[]>("CREATE agent_log CONTENT $entry RETURN VALUE record::id(id)", {
+        entry: {
+          session: sessionId(session), ...(user ? { user } : {}), agent, input, output, ms: Math.round(ms), usd,
+          callId, attempt, ...(turn === undefined ? {} : { turn }), ...(turnAttempt === undefined ? {} : { turnAttempt }),
+          outcome, costStatus, ...(status ? { status } : {}), ...(dropped ? { dropped } : {}),
+        },
+      });
+      const id = ids[0];
+      if (typeof id !== "string" || !id) throw new Error("The agent_log reservation didn't return its record id");
+      return id;
+    },
+
+    async finishAgentCall(id, { output, ms, usd, outcome, costStatus, status, dropped }) {
+      const fields = ["output = $output", "ms = $ms", "usd = $usd", "outcome = $outcome", "costStatus = $costStatus"];
+      const bindings: Record<string, unknown> = {
+        id: agentLogId(id), output, ms: Math.round(ms), usd, outcome, costStatus,
+      };
+      if (status !== undefined) {
+        fields.push("status = $status");
+        bindings.status = status;
+      }
+      if (dropped !== undefined) {
+        fields.push("dropped = $dropped");
+        bindings.dropped = dropped;
+      }
+      const updated = await one<string[]>(`UPDATE ONLY $id SET ${fields.join(", ")} RETURN VALUE record::id(id)`, bindings);
+      if (!updated.includes(id)) throw new Error(`The agent_log reservation ${id} was not finalized`);
+    },
+
+    async logAgentCall({ session, user, agent, input, output, ms, usd, callId, attempt, turn, turnAttempt, outcome, costStatus, status, dropped }) {
       await one("CREATE agent_log CONTENT $entry RETURN NONE", {
-        entry: { session: sessionId(session), ...(user ? { user } : {}), agent, input, output, ms: Math.round(ms), usd, ...(dropped ? { dropped } : {}) },
+        entry: {
+          session: sessionId(session), ...(user ? { user } : {}), agent, input, output, ms: Math.round(ms), usd,
+          callId, attempt, ...(turn === undefined ? {} : { turn }), ...(turnAttempt === undefined ? {} : { turnAttempt }),
+          outcome, costStatus, ...(status ? { status } : {}), ...(dropped ? { dropped } : {}),
+        },
       });
     },
 
@@ -218,7 +368,7 @@ export function createStore(db: Surreal): Store {
 
     async memoryReads(user) {
       // a path through the facts array gives the ids as one array; NONE on a call that got no memory
-      const rows = await one<{ ids: unknown }[]>('SELECT input.memory.facts.id AS ids FROM agent_log WHERE session.user = $user AND agent IN ["hint_giver", "coach"]', { user });
+      const rows = await one<{ ids: unknown }[]>('SELECT input.memory.facts.id AS ids FROM agent_log WHERE session.user = $user AND agent IN ["hint_giver", "coach"] AND outcome != "started"', { user });
       return rows.map((row) => (Array.isArray(row.ids) ? row.ids.filter((id): id is string => typeof id === "string") : []));
     },
 

@@ -9,7 +9,12 @@ export type ClerkConfig = { jwtKey: string; authorizedParties: string[] };
 // production). Render's environment form keeps a PEM on one line, so written-out \n become newlines.
 export function clerkConfigFromEnv(authorizedParties: string[], env: NodeJS.ProcessEnv = process.env): ClerkConfig | null {
   const jwtKey = env.CLERK_JWT_KEY?.trim().replaceAll("\\n", "\n");
-  if (!jwtKey) return null;
+  if (!jwtKey) {
+    if (env.NODE_ENV === "production" || env.RENDER_GIT_COMMIT) {
+      throw new Error("CLERK_JWT_KEY is required in production or on Render; no learner could sign in");
+    }
+    return null;
+  }
   if (!jwtKey.startsWith("-----BEGIN PUBLIC KEY-----")) {
     throw new Error("CLERK_JWT_KEY must be the PEM public key (Clerk dashboard, API keys, Show JWT public key)");
   }

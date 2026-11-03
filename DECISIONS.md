@@ -968,3 +968,54 @@ Format: **Decision** · **Instead of** · **Why** · **Pattern / trade-off**
 - **Pattern / trade-off:** validate new requests strictly while retaining the stored format. Old long answers
   remain in their sessions; agent input and output schemas keep their existing bounds.
 
+### 2026-10-28 · Resolve uncertain memory writes before deleting a learner's scope
+- **Decision:** every Agent Memory fact write sends an `Idempotency-Key` derived from its exact request body. Scope
+  registration and fact writes retry transient failures until confirmed. After an ambiguous result, even a later 4xx
+  does not release the in-process fence. `DELETE /me/data` waits for tracked writes before purging. Fact retries stop
+  before the provider's 24-hour key-retention window; unresolved work keeps the fence pending. The
+  route returns `502` after 30 seconds. New writes and delete retries wait behind that fence.
+- **Instead of:** purging after an arbitrary grace sleep, which can race a delayed provider commit, or keeping the HTTP
+  request open indefinitely during an outage.
+- **Why:** Agent Memory documents idempotent fact writes and an in-flight `409`, which lets the API resolve an uncertain
+  request without creating a duplicate. The public docs do not promise ordering between a pending write and scope forget.
+- **Pattern / trade-off:** fail closed in this process; a `502` can precede eventual deletion, so the learner retries to
+  observe completion. The fence does not survive a process restart or coordinate multiple API processes; live-provider
+  behavior remains to be checked before claiming an end-to-end guarantee.
+
+### 2026-10-29 · Session starts retain their retry identity until the session finishes
+- **Decision:** persist a random start key before sending, scoped to API, authentication kind, learner and
+  normalized body. Keep successful keys while their session is unfinished. Read current server state after
+  replay and restore the transcript for an advanced session. Replace a key only after the session reaches
+  its result. Deletion clears the scope. Credentials come from the same Clerk session as the key's learner.
+- **Instead of:** unkeyed retries or deleting the key as soon as one response arrives. A regression showed
+  that one successful tab could otherwise erase the key needed by another tab whose response was lost.
+- **Why:** preserve the Oct 25 rule that an unfinished concept continues, and preserve the learner's own
+  accumulated work described in [the product thesis](wiki/synthesis/product-thesis.md). The four parts,
+  their order, prompts, levels and scoring stay unchanged.
+- **Pattern / trade-off:** browser storage reservations use Web Locks; native writes use a temporary file
+  followed by rename. Failure to persist prevents a start. This adds a current-Turn read and retains opaque
+  local keys until completion/replacement or deletion. Tests with mocked native storage do not prove
+  crash durability on a physical device. Cross-process server deletion and provider fencing remain separate.
+
+### 2026-10-29 · Account for transient Claude retries and serialize concurrent Turn work
+- **Decision:** disable hidden SDK retries. Retry one transient Messages failure only when its per-attempt
+  reservation fits the process budget and the attempt reservation was persisted before send. Give both attempts
+  one `callId`, distinct attempt numbers and separate `agent_log` rows; finalize each row after usage or failure
+  is known. Record measured usage when returned, a conservative maximum reservation when a connection ends
+  without usage, and zero for provider error responses. A database lease admits one handler per session/Turn
+  across API instances; renew while working and fence stale saves.
+- **Instead of:** allowing the SDK to resend outside budget accounting, or allowing simultaneous API copies to
+  spend model calls for the same saved Turn.
+- **Why:** local red harnesses reproduced both duplicate model work and an unlogged SDK retry. The learner chose
+  one automatic retry, counted against the configured cap and recorded in `agent_log`.
+- **Pattern / trade-off:** the token-count endpoint adds a free but rate-limited request. A connection failure can
+  leave actual provider cost unknown, so the budget holds its maximum reservation without claiming it was billed.
+  A failed log insert prevents the paid Messages request; a failed final update leaves the durable row reserved.
+  Budget spend remains process-local and resets on restart; replicas do not share a counter. The client resends the
+  same Turn once after a transport failure or 5xx. A duplicate waits up to 125 seconds and can reclaim one expired
+  2-minute Turn lease; its 225-second deadline covers that wait, the normal 90-second request window and 10 seconds
+  for the reply. A pause or database outage longer than the lease can permit duplicate in-flight model work, though a
+  replaced claim fences the stale save. No provider exactly-once guarantee is claimed. The one recovery is per send:
+  a waiting duplicate takes over once, and the learner's next send runs the Turn again, so two failed attempts during
+  an outage can't refuse a Turn for good (audit, Nov 2).
+

@@ -1,7 +1,7 @@
 // Where the device keeps the saved sessions (saved.ts), one entry per session: the browser's storage on the web,
 // files in a folder of the app's own documents on a phone (expo-file-system, which every Expo build already carries,
-// so the fingerprint doesn't change). Every call swallows its errors: a device that can't keep a record just can't
-// offer to resume, and the session itself is never affected.
+// so the fingerprint doesn't change). Reads/writes are best effort; enumeration and deletion must report failure
+// so Delete my data cannot claim success while notes remain on the device.
 import { Directory, File, Paths } from "expo-file-system";
 import { Platform } from "react-native";
 import type { SavedSessionStorage } from "./saved.ts";
@@ -18,7 +18,10 @@ const web = Platform.OS === "web";
 const folder = () => new Directory(Paths.document, "sessions");
 const fileOf = (id: string) => new File(folder(), `${id}.json`);
 const legacyFile = () => new File(Paths.document, LEGACY_NAME);
-const store = () => (typeof localStorage === "undefined" ? null : localStorage);
+const store = () => {
+  if (typeof localStorage === "undefined") throw new Error("Device storage is unavailable");
+  return localStorage;
+};
 
 async function quietly<T>(work: () => T | Promise<T>, otherwise: T): Promise<T> {
   try {
@@ -40,12 +43,11 @@ function webIds(): string[] {
 }
 
 export const deviceStorage: SavedSessionStorage = {
-  ids: () =>
-    quietly(() => {
+  ids: async () => {
       if (web) return webIds();
       const dir = folder();
       return dir.exists ? dir.list().flatMap((entry) => (entry instanceof File && entry.name.endsWith(".json") && ID.test(entry.name.slice(0, -5)) ? [entry.name.slice(0, -5)] : [])) : [];
-    }, []),
+  },
   read: (id) =>
     quietly(async () => {
       if (!ID.test(id)) return null;
@@ -66,8 +68,7 @@ export const deviceStorage: SavedSessionStorage = {
       if (!f.exists) f.create();
       await f.write(text);
     }, undefined),
-  remove: (id) =>
-    quietly(() => {
+  remove: async (id) => {
       if (!ID.test(id)) return;
       if (web) {
         store()?.removeItem(PREFIX + id);
@@ -75,7 +76,7 @@ export const deviceStorage: SavedSessionStorage = {
       }
       const f = fileOf(id);
       if (f.exists) f.delete();
-    }, undefined),
+  },
   legacy: {
     read: () =>
       quietly(async () => {
@@ -83,14 +84,13 @@ export const deviceStorage: SavedSessionStorage = {
         const f = legacyFile();
         return f.exists ? await f.text() : null;
       }, null),
-    remove: () =>
-      quietly(() => {
+    remove: async () => {
         if (web) {
           store()?.removeItem(LEGACY_KEY);
           return;
         }
         const f = legacyFile();
         if (f.exists) f.delete();
-      }, undefined),
+    },
   },
 };
