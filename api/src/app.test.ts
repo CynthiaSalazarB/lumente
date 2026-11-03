@@ -1311,8 +1311,9 @@ function slowMemory() {
 
 const wholeMap = { concept: "ecosystem", supraordinate: { value: "system", note: null }, exclusion: [{ value: "habitat", note: "only the place" }], isoordinate: [{ value: "living things", note: null }], infraordinate: [{ value: "aquatic ecosystem", note: null }] };
 
-test("Delete my data stops the memory write a result started: the write in flight lands, the purge comes after it, and memory keeps nothing", async (t) => {
+test("Delete my data stops the memory write a result started: the write in flight lands, the purge comes after it, and memory keeps nothing", { timeout: 10_000 }, async (t) => {
   const { memory, facts, calls, writing, held } = slowMemory();
+  t.after(() => held.resolve());
   const store = memoryStore();
   const claude = fakeClaude([["evaluator_full", { rubric: MOVE_ORDER.map((move) => ({ move, quality: 2, feedback: "Scripted." })) }]], store);
   const url = await start(t, { ...noDb, store, advance, callAgentFor: claude.callAgentFor, memory });
@@ -1321,8 +1322,16 @@ test("Delete my data stops the memory write a result started: the write in fligh
   const done = await (await answer(url, first.sessionId, { turn: map.turn, mentefacto: wholeMap })).json();
   assert.equal(done.result.score, 8);
   await writing.promise;
+  // As in the next test: wait for erase to abort the write in flight, not for elapsed time (Nov 2).
+  const deleteBegan = Promise.withResolvers<void>();
+  const abort = AbortController.prototype.abort;
+  const stopping = t.mock.method(AbortController.prototype, "abort", function (this: AbortController, reason?: unknown) {
+    abort.call(this, reason);
+    deleteBegan.resolve();
+  });
   const deleting = fetch(`${url}/me/data`, { method: "DELETE", headers: as("leo") });
-  await sleep(50);
+  await deleteBegan.promise;
+  stopping.mock.restore();
   assert.deepEqual(calls, ["write level_supraordinate"], "the purge waits for the write in flight");
   held.resolve();
   assert.equal((await deleting).status, 204);
