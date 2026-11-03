@@ -37,10 +37,11 @@ DEFINE FIELD OVERWRITE session ON agent_log TYPE record<session>;
 DEFINE FIELD OVERWRITE agent ON agent_log TYPE string;
 DEFINE FIELD OVERWRITE ms ON agent_log TYPE int;
 DEFINE FIELD OVERWRITE usd ON agent_log TYPE number;
-DEFINE FIELD OVERWRITE callId ON agent_log TYPE string;
-DEFINE FIELD OVERWRITE attempt ON agent_log TYPE int ASSERT $value >= 1;
-DEFINE FIELD OVERWRITE outcome ON agent_log TYPE "started" | "success" | "failed";
-DEFINE FIELD OVERWRITE costStatus ON agent_log TYPE "measured" | "reserved" | "not_charged";
+-- Optional: the release before them writes none, while it still serves during a deploy and after a rollback.
+DEFINE FIELD OVERWRITE callId ON agent_log TYPE option<string>;
+DEFINE FIELD OVERWRITE attempt ON agent_log TYPE option<int> ASSERT $value = NONE OR $value >= 1;
+DEFINE FIELD OVERWRITE outcome ON agent_log TYPE option<"started" | "success" | "failed">;
+DEFINE FIELD OVERWRITE costStatus ON agent_log TYPE option<"measured" | "reserved" | "not_charged">;
 DEFINE FIELD OVERWRITE at ON agent_log TYPE datetime DEFAULT time::now() READONLY;
 DEFINE FIELD OVERWRITE user ON agent_log TYPE option<string>;
 DEFINE FIELD OVERWRITE turn ON agent_log TYPE option<int>;

@@ -299,6 +299,17 @@ test("the store against a real SurrealDB", { skip: url ? false : "set SURREAL_TE
     await assert.rejects(store.createSession("kyle", { concept: "x", material: null, mode: "exam" as "test" }));
   });
 
+  // Nov 2: Render deploys a merge while the previous release still serves, and a rollback runs that release on this
+  // schema; its agent_log rows have none of the attempt fields.
+  await t.test("the schema still takes the previous release's agent_log rows, and still refuses a bad attempt", async () => {
+    const owner = await store.createSession("previous-release", { concept: "x", material: null, mode: "learn" });
+    const row = { session: new RecordId("session", owner.id), user: "previous-release", agent: "questioner", input: {}, output: {}, ms: 1, usd: 0 };
+    await db.query("CREATE agent_log CONTENT $row RETURN NONE", { row }).collect();
+    await assert.rejects(db.query("CREATE agent_log CONTENT $row RETURN NONE", { row: { ...row, callId: "c", attempt: 0, outcome: "success", costStatus: "measured" } }).collect());
+    await assert.rejects(db.query("CREATE agent_log CONTENT $row RETURN NONE", { row: { ...row, callId: "c", attempt: 1, outcome: "maybe", costStatus: "measured" } }).collect());
+    await db.query("DELETE agent_log WHERE user = 'previous-release'").collect();
+  });
+
   await t.test("the Memory sheet's two reads: the finished concepts, each once, and the fact ids each hint giver or coach call received", async () => {
     const result = { predictedScore: 7, score: 3, maxScore: 8 as const, calibrationGap: 4, hintsUsed: 0, rubric: [], masteryChanges: [], questions: { asked: 0, testing: 0 }, coach: null };
     const api1 = await store.createSession("reader", { concept: "API", material: null, mode: "learn" });
