@@ -1331,13 +1331,14 @@ test("Delete my data stops the memory write a result started: the write in fligh
   assert.deepEqual(facts, []);
 });
 
-test("a result saved while Delete my data waits for it leaves nothing for memory to write", async (t) => {
-  const { memory, facts, calls } = slowMemory();
+test("a result saved while Delete my data waits for it leaves nothing for memory to write", { timeout: 10_000 }, async (t) => {
+  const { memory, facts, calls, held: memoryHeld } = slowMemory();
   const remembers = t.mock.method(memory, "remember");
   const store = memoryStore();
   const claude = fakeClaude([["evaluator_full", { rubric: MOVE_ORDER.map((move) => ({ move, quality: 2, feedback: "Scripted." })) }]], store);
   const reached = Promise.withResolvers<void>();
   const held = Promise.withResolvers<void>();
+  t.after(() => { held.resolve(); memoryHeld.resolve(); });
   const callAgentFor = (id: string): CallAgent => {
     const call = claude.callAgentFor(id);
     return async (agent, input) => {
@@ -1353,12 +1354,20 @@ test("a result saved while Delete my data waits for it leaves nothing for memory
   const map = await (await answer(url, first.sessionId, { turn: first.turn, prediction: 5 })).json();
   const submitting = answer(url, first.sessionId, { turn: map.turn, mentefacto: wholeMap });
   await reached.promise;
+  // erase aborts the learner's in-flight work before waiting for it. Observe the real abort,
+  // not elapsed HTTP scheduling time, while the evaluator is the only held request.
+  const deleteBegan = Promise.withResolvers<void>();
+  const abort = AbortController.prototype.abort;
+  const stopping = t.mock.method(AbortController.prototype, "abort", function (this: AbortController, reason?: unknown) {
+    abort.call(this, reason);
+    deleteBegan.resolve();
+  });
   const deleting = fetch(`${url}/me/data`, { method: "DELETE", headers: as("leo") });
-  await sleep(20);
+  await deleteBegan.promise;
+  stopping.mock.restore();
   held.resolve();
   const [submitted, deleted] = await Promise.all([submitting, deleting]);
   assert.deepEqual([submitted.status, deleted.status], [200, 204]);
-  await sleep(50);
   assert.equal(remembers.mock.callCount(), 0);
   assert.deepEqual(calls, ["forget"]);
   assert.deepEqual(facts, []);
