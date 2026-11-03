@@ -376,11 +376,12 @@ export function createApp({ corsOrigins, checkDb, store, advance, callAgentFor, 
             }
             const claimState = await who.store.turnClaimState(who.user, session.id, turn);
             if (claimState && !claimState.active) {
-              turnAttempt = await who.store.claimTurn(who.user, session.id, turn, claimId);
+              turnAttempt = await who.store.claimTurn(who.user, session.id, turn, claimId, true);
               if (turnAttempt !== null) break;
               const after = await who.store.turnClaimState(who.user, session.id, turn);
               if (after && !after.active) {
-                res.json({ ...current.lastTurn, error: { code: "agent_failed", retryable: after.attempts < 2 } });
+                // the send this request duplicates had its one recovery already; the learner's next send runs again
+                res.json({ ...current.lastTurn, error: { code: "agent_failed", retryable: true } });
                 return;
               }
             }
@@ -426,7 +427,7 @@ export function createApp({ corsOrigins, checkDb, store, advance, callAgentFor, 
         // unchanged session and mastery back here could overwrite what a parallel request saved meanwhile.
         if (next.turn.error) {
           await releaseClaim();
-          res.json(turnAttempt < 2 ? next.turn : { ...next.turn, error: { ...next.turn.error, retryable: false } });
+          res.json(next.turn);
           return;
         }
         // the words of the facts a hint or the coach cited, so the app can show where they came from
@@ -439,7 +440,7 @@ export function createApp({ corsOrigins, checkDb, store, advance, callAgentFor, 
         if (!checked.success) {
           console.error(`Turn ${next.turn.turn} of session ${session.id} is off the contract and wasn't saved: ${describe(checked.error.issues)}`);
           await releaseClaim();
-          res.json({ ...latest, error: { code: "agent_failed", retryable: turnAttempt < 2 } });
+          res.json({ ...latest, error: { code: "agent_failed", retryable: true } });
           return;
         }
         // CONTRACTS.md section 3: a test session never writes mastery. Only the moves this Turn moved on are written, in
@@ -453,7 +454,7 @@ export function createApp({ corsOrigins, checkDb, store, advance, callAgentFor, 
           const saved = await who.store.getSession(who.user, session.id);
           await releaseClaim();
           if (saved?.lastTurn && saved.turn > session.turn) res.json(saved.lastTurn);
-          else if (saved?.lastTurn) res.json({ ...saved.lastTurn, error: { code: "agent_failed", retryable: turnAttempt < 2 } });
+          else if (saved?.lastTurn) res.json({ ...saved.lastTurn, error: { code: "agent_failed", retryable: true } });
           else res.status(404).json({ error: "No such session" });
           return;
         }

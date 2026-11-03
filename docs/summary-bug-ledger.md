@@ -1,6 +1,6 @@
 # Consolidated bug-fix loop
 
-Updated October 29, 2026. Working branch: `summary`. Base: `8218c33d510245306b7e8a039d5d98dd837bf74a`.
+Updated November 2, 2026. Working branch: `summary`. Base: `8218c33d510245306b7e8a039d5d98dd837bf74a`.
 Workspace: `C:/Users/leooa/.codex/worktrees/sequential-bug-fixes/build-north`.
 This ledger describes local work, not a merge or deployment. Other branches are preserved.
 
@@ -28,6 +28,22 @@ This ledger describes local work, not a merge or deployment. Other branches are 
 - Original project checkout remains separate at `leo/claude-skills-oct25`; no resets, merges, or force pushes performed.
 
 ## New fixes verified locally
+
+- Nov 2 audit (`C:/tmp/lumente-audit-20261102-report.md`) found two regressions in this branch; both reproduced
+  twice against SurrealDB 3.3.2 before any edit, then fixed with tests written red first.
+  1. The Turn attempt cap counted every claim, so two failed attempts refused every later send to that Turn (a changed
+     answer, Help, the map), and the second failure came back `retryable: false`, which also disables the prediction
+     button. A send's own claim is now attempt 1; only a duplicate that waited behind a handler takes over (attempt 2,
+     the cap); agent failures stay retryable as on main. `TurnClaimState.attempts` went with the old check.
+  2. `export:testers` parsed raw rows with the strict Session schema and exited 1 on the lease fields a Turn leaves.
+     It now reads rows through the store's `sessionRecord`.
+  Proof: route and real-database tests for a manual retry after two failures, a map after an outage, the duplicate
+  cap and the export of an API-finished session; each failed before the fix, and mutation runs (removing either fix)
+  failed them again. Audit probe after the fix: second failure retryable, map reaches `result`; the real exporter exits
+  0. Full suites twice: app 140, API 152, agents 125 = 417, zero failures or skips; typechecks pass; Chromium 390 px
+  browser recovery passes. CONTRACTS.md's duplicate wait now says 125 s, matching `TURN_CLAIM_WAIT_MS`.
+  Pre-existing and timing-sensitive, not changed here: `a result saved while Delete my data waits for it` (also on
+  main) failed once with `[200, 502]` while two test files ran in parallel, and passed 3/3 alone.
 
 - Dependency alignment continuation: `npm ls zod --json` reproduced ELSPROBLEMS: Expo CLI 58.1.17
   declares `^3.25.76`, while the inherited root override forced 4.6.7. Removed that override and reconciled

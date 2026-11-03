@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import { writeFile } from "node:fs/promises";
-import { MOVE_ORDER, Session, type MoveId } from "@build-north/agents";
+import { MOVE_ORDER, type MoveId, type Session } from "@build-north/agents";
+import type { Surreal } from "surrealdb";
 import { connectSurreal, queryTimeout, surrealConfigFromEnv } from "./db.ts";
+import { sessionRecord } from "./store.ts";
 
 // The testers' numbers (#50): every finished test session (the pre-test and the post-test of each
 // tester, docs/tester-protocol.md), as rows of docs/grading-sheet.csv, so Cynthia pastes them in and
@@ -100,6 +102,17 @@ const cell = (value: string) => {
   return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 };
 
+/** Every finished test session in the database, oldest first. Rows go through the store's conversion, which drops the
+ * API's Turn lease fields: the strict Session schema refused them and stopped the whole export (audit, Nov 2). */
+export async function finishedTestSessions(db: Surreal): Promise<Session[]> {
+  const [rows] = await db
+    .query('SELECT *, record::id(id) AS id FROM session WHERE mode = "test" AND result != NONE ORDER BY createdAt')
+    .json()
+    .signal(queryTimeout())
+    .collect<[Record<string, unknown>[]]>();
+  return rows.map(sessionRecord);
+}
+
 /** The sheet as CSV text, header first, one line per row, in the sheet's column order. */
 export function toCsv(rows: readonly SheetRow[]): string {
   const lines = [SHEET_COLUMNS.join(","), ...rows.map((row) => SHEET_COLUMNS.map((column) => cell(row[column])).join(","))];
@@ -117,13 +130,7 @@ async function main(out: string): Promise<number> {
   }
   const db = await connectSurreal(config);
   try {
-    const [rows] = await db
-      .query('SELECT *, record::id(id) AS id FROM session WHERE mode = "test" AND result != NONE ORDER BY createdAt')
-      .json()
-      .signal(queryTimeout())
-      .collect<[unknown[]]>();
-    const sessions = rows.map((row) => Session.parse(row));
-    const { rows: sheet, maps } = sheetOf(sessions, process.env.LEARNER_ID_SALT ?? "");
+    const { rows: sheet, maps } = sheetOf(await finishedTestSessions(db), process.env.LEARNER_ID_SALT ?? "");
     const mapsPath = out.replace(/\.csv$/i, "") + ".maps.json";
     await writeFile(out, toCsv(sheet), "utf8");
     await writeFile(mapsPath, `${JSON.stringify(maps, null, 2)}\n`, "utf8");

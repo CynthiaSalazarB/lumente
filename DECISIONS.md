@@ -1015,5 +1015,7 @@ Format: **Decision** · **Instead of** · **Why** · **Pattern / trade-off**
   same Turn once after a transport failure or 5xx. A duplicate waits up to 125 seconds and can reclaim one expired
   2-minute Turn lease; its 225-second deadline covers that wait, the normal 90-second request window and 10 seconds
   for the reply. A pause or database outage longer than the lease can permit duplicate in-flight model work, though a
-  replaced claim fences the stale save. No provider exactly-once guarantee is claimed.
+  replaced claim fences the stale save. No provider exactly-once guarantee is claimed. The one recovery is per send:
+  a waiting duplicate takes over once, and the learner's next send runs the Turn again, so two failed attempts during
+  an outage can't refuse a Turn for good (audit, Nov 2).
 

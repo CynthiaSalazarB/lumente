@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
-import { test } from "node:test";
-import { DemoSeed, Session as SessionSchema, advance, type Level } from "@build-north/agents";
+import { test, type TestContext } from "node:test";
+import { DemoSeed, MOVE_ORDER, Session as SessionSchema, advance, type CallAgent, type Level } from "@build-north/agents";
 import demoSeed from "@build-north/agents/fixtures/demo-seed.json" with { type: "json" };
 import { RecordId, Surreal } from "surrealdb";
 import { advanceStub, callAgentStub } from "./advance-stub.ts";
 import { createApp } from "./app.ts";
 import { loadDemoSeed } from "./demo-seed.ts";
+import { finishedTestSessions, sheetOf } from "./export-testers.ts";
 import { createStore, defineSchema, initialSession } from "./store.ts";
 
 // Needs a real SurrealDB and a root user, for example a local container:
@@ -119,16 +120,16 @@ test("the store against a real SurrealDB", { skip: url ? false : "set SURREAL_TE
     assert.equal((await store.getSession("turn-claim", session.id))?.turn, 0, "active lease fields stay out of the strict Session contract");
     const owner = claims[0] === 1 ? "claim-a" : "claim-b";
     const stale = owner === "claim-a" ? "claim-b" : "claim-a";
-    assert.deepEqual(await store.turnClaimState("turn-claim", session.id, session.turn), { active: true, attempts: 1 });
+    assert.deepEqual(await store.turnClaimState("turn-claim", session.id, session.turn), { active: true });
     assert.equal(await store.renewTurnClaim("turn-claim", session.id, session.turn, owner), true);
     assert.equal(await store.renewTurnClaim("turn-claim", session.id, session.turn, stale), false);
     const next = await advanceStub({ session, mastery: await store.getMastery("turn-claim") }, { action: "start" }, callAgentStub);
     assert.equal(await store.saveSession(next.session, session.turn), false, "an unclaimed writer cannot clear an active lease");
 
     await db.query("UPDATE $id SET activeTurnClaimUntil = time::now() - 1s", { id: new RecordId("session", session.id) }).collect();
-    assert.deepEqual(await store.turnClaimState("turn-claim", session.id, session.turn), { active: false, attempts: 1 });
-    assert.equal(await store.claimTurn("turn-claim", session.id, session.turn, "recovered"), 2);
-    assert.deepEqual(await store.turnClaimState("turn-claim", session.id, session.turn), { active: true, attempts: 2 });
+    assert.deepEqual(await store.turnClaimState("turn-claim", session.id, session.turn), { active: false });
+    assert.equal(await store.claimTurn("turn-claim", session.id, session.turn, "recovered", true), 2);
+    assert.deepEqual(await store.turnClaimState("turn-claim", session.id, session.turn), { active: true });
     assert.equal(await store.saveSession(next.session, session.turn, [], owner), false, "an expired owner cannot commit after reclamation");
     assert.equal(await store.saveSession(next.session, session.turn, [], "recovered"), true);
     assert.equal(await store.turnClaimState("turn-claim", session.id, session.turn), null, "a saved next Turn has no claim state for the old Turn");
@@ -136,15 +137,70 @@ test("the store against a real SurrealDB", { skip: url ? false : "set SURREAL_TE
     assert.equal(await store.claimTurn("turn-claim", session.id, 1, "next-turn"), 1, "the next Turn gets a fresh first attempt");
   });
 
-  await t.test("a recovered Turn can only be claimed once, including after a store reconnect", async () => {
-    const session = await store.createSession("turn-retry-limit", { concept: "democracy", material: null, mode: "learn" });
+  await t.test("a waiting request takes a Turn over once, and the learner's next send claims it again, including after a store reconnect", async () => {
+    const session = await store.createSession("turn-next-send", { concept: "democracy", material: null, mode: "learn" });
     const id = new RecordId("session", session.id);
-    assert.equal(await store.claimTurn("turn-retry-limit", session.id, session.turn, "first"), 1);
-    await db.query("UPDATE $id SET activeTurnClaimUntil = time::now() - 1s", { id }).collect();
-    assert.equal(await store.claimTurn("turn-retry-limit", session.id, session.turn, "one-recovery"), 2);
-    await db.query("UPDATE $id SET activeTurnClaimUntil = time::now() - 1s", { id }).collect();
-    assert.deepEqual(await store.turnClaimState("turn-retry-limit", session.id, session.turn), { active: false, attempts: 2 });
-    assert.equal(await createStore(db).claimTurn("turn-retry-limit", session.id, session.turn, "second-recovery"), null);
+    const expire = () => db.query("UPDATE $id SET activeTurnClaimUntil = time::now() - 1s", { id }).collect();
+    assert.equal(await store.claimTurn("turn-next-send", session.id, session.turn, "first"), 1);
+    await expire();
+    assert.equal(await store.claimTurn("turn-next-send", session.id, session.turn, "one-recovery", true), 2);
+    await expire();
+    assert.equal(await createStore(db).claimTurn("turn-next-send", session.id, session.turn, "second-recovery", true), null);
+    assert.equal(await createStore(db).claimTurn("turn-next-send", session.id, session.turn, "next-send"), 1, "earlier failures don't refuse a new send");
+    assert.equal(await store.claimTurn("turn-next-send", session.id, session.turn, "while-held"), null, "the new send holds the lease");
+  });
+
+  // The routes over this database for one learner, with `call` answering for Claude.
+  const routesFor = async (st: TestContext, call: CallAgent, user: string) => {
+    const server = createApp({ corsOrigins: [], checkDb: null, store, advance, callAgentFor: () => call, userFromToken: null, devKey: "k", memory: null }).listen(0);
+    st.after(() => server.close());
+    await once(server, "listening");
+    const api = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    return async (path: string, body: unknown) =>
+      (await fetch(`${api}${path}`, { method: "POST", headers: { "content-type": "application/json", "x-dev-user": user, "x-dev-key": "k" }, body: JSON.stringify(body) })).json();
+  };
+  const wholeMap = { concept: "API", supraordinate: { value: "interface", note: null }, exclusion: [{ value: "implementation", note: "different" }], isoordinate: [{ value: "contract", note: null }], infraordinate: [{ value: "web API", note: null }] };
+  const evaluated = { rubric: MOVE_ORDER.map((move) => ({ move, quality: 2, feedback: "correct" })) };
+
+  // Audit, Nov 2: the route-level case, through the real orchestrator and this database.
+  await t.test("a provider outage that fails a Turn twice doesn't block the learner's next send", async (st) => {
+    let outage = true;
+    const calls: string[] = [];
+    const send = await routesFor(st, async (agent) => {
+      calls.push(agent);
+      if (outage) throw new Error("temporary provider outage");
+      if (agent === "evaluator_full") return evaluated;
+      throw new Error(`unexpected agent ${agent}`);
+    }, "outage");
+    const first = await send("/sessions", { concept: "API", mode: "test" });
+    const map = await send(`/sessions/${first.sessionId}/turns`, { turn: first.turn, prediction: 5 });
+    assert.equal(map.expects, "map");
+    for (let i = 0; i < 2; i++) {
+      const failed = await send(`/sessions/${first.sessionId}/turns`, { turn: map.turn, question: "What is a protocol?" });
+      assert.deepEqual([failed.turn, failed.error], [map.turn, { code: "agent_failed", retryable: true }]);
+    }
+    outage = false;
+    const result = await send(`/sessions/${first.sessionId}/turns`, { turn: map.turn, mentefacto: wholeMap });
+    assert.deepEqual([result.phase, result.error], ["result", null]);
+    assert.deepEqual(calls, ["fact_desk", "fact_desk", "evaluator_full"]);
+  });
+
+  // Audit, Nov 2: the export parsed rows with the strict Session schema, which refused the lease fields a Turn leaves.
+  await t.test("the tester export reads a test session the API finished, lease fields and all", async (st) => {
+    const send = await routesFor(st, async (agent) => {
+      if (agent === "evaluator_full") return evaluated;
+      throw new Error(`unexpected agent ${agent}`);
+    }, "exported");
+    const first = await send("/sessions", { concept: "API", mode: "test" });
+    const map = await send(`/sessions/${first.sessionId}/turns`, { turn: first.turn, prediction: 5 });
+    assert.equal((await send(`/sessions/${first.sessionId}/turns`, { turn: map.turn, mentefacto: wholeMap })).phase, "result");
+    const [lease] = await db
+      .query("SELECT turnClaimFor, turnClaimAttempts FROM ONLY $id", { id: new RecordId("session", first.sessionId) })
+      .json()
+      .collect<[unknown]>();
+    assert.deepEqual(lease, { turnClaimFor: map.turn, turnClaimAttempts: 1 }, "the finished row keeps the API's lease fields");
+    const { rows } = sheetOf(await finishedTestSessions(db), "");
+    assert.equal(rows.filter((row) => row.notes.endsWith(`session ${first.sessionId}`)).length, 1);
   });
 
   await t.test("a Turn's progress lands with its session or not at all, never lowers a stored level, and adds to the stored successes", async () => {

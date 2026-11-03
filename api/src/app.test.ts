@@ -116,13 +116,13 @@ function memoryStore(): Store & { logs: readonly AgentLogEntry[]; expireTurnClai
       if (progress.length > 0) mastery.set(session.user, { moves });
       return true;
     },
-    async claimTurn(user, id, turn, claimId) {
+    async claimTurn(user, id, turn, claimId, recovery = false) {
       const session = sessions.get(id);
       if (session?.user !== user || session.turn !== turn) return null;
       const key = turnClaimKey(id, turn);
       const held = turnClaims.get(key);
       if (held && held.until > Date.now()) return null;
-      const attempts = (turnClaimAttempts.get(key) ?? 0) + 1;
+      const attempts = recovery ? (turnClaimAttempts.get(key) ?? 0) + 1 : 1;
       if (attempts > 2) return null;
       turnClaimAttempts.set(key, attempts);
       turnClaims.set(key, { user, turn, claimId, until: Date.now() + 120_000 });
@@ -132,10 +132,7 @@ function memoryStore(): Store & { logs: readonly AgentLogEntry[]; expireTurnClai
       const session = sessions.get(id);
       if (session?.user !== user || session.turn !== turn) return null;
       const held = turnClaims.get(turnClaimKey(id, turn));
-      return {
-        active: held?.user === user && held.until > Date.now(),
-        attempts: turnClaimAttempts.get(turnClaimKey(id, turn)) ?? 0,
-      };
+      return { active: held?.user === user && held.until > Date.now() };
     },
     expireTurnClaim(user, id, turn) {
       const held = turnClaims.get(turnClaimKey(id, turn));
@@ -518,30 +515,79 @@ test("a Turn whose agent failed adds no step, and a session saved before Oct 25 
   assert.deepEqual(await transcript(), []);
 });
 
-test("a recovered Turn runs once and refuses a third handler attempt", async (t) => {
+// Audit, Nov 2: two failed attempts used to refuse every later send to the Turn, for good.
+test("after two failed sends, the learner's next send runs the Turn again", async (t) => {
   const store = memoryStore();
   const claimedAttempts: number[] = [];
+  let outage = true;
   let answers = 0;
-  const advanceWithFailure: Advance = async (state, input, callAgent) => {
+  const advanceWithOutage: Advance = async (state, input, callAgent) => {
     if ("action" in input && input.action === "start") return advanceStub(state, input, callAgent);
     answers++;
-    return { ...state, turn: { ...state.session.lastTurn!, error: { code: "agent_failed", retryable: true } } };
+    return outage ? { ...state, turn: { ...state.session.lastTurn!, error: { code: "agent_failed", retryable: true } } } : advanceStub(state, input, callAgent);
   };
   const callAgentFor: AppOptions["callAgentFor"] = (_session, _user, _turn, turnAttempt) => {
     if (turnAttempt !== undefined) claimedAttempts.push(turnAttempt);
     return callAgentStub;
   };
-  const url = await start(t, { ...noDb, store, advance: advanceWithFailure, callAgentFor });
+  const url = await start(t, { ...noDb, store, advance: advanceWithOutage, callAgentFor });
   const { sessionId } = await (await post(url, { concept: "democracy" })).json();
 
-  const first = await (await answer(url, sessionId, { turn: 1, prediction: 5 })).json();
-  assert.deepEqual(first.error, { code: "agent_failed", retryable: true });
+  for (let i = 0; i < 2; i++) {
+    const failed = await (await answer(url, sessionId, { turn: 1, prediction: 5 })).json();
+    assert.deepEqual(failed.error, { code: "agent_failed", retryable: true });
+  }
+  outage = false;
   const recovered = await (await answer(url, sessionId, { turn: 1, prediction: 5 })).json();
-  assert.deepEqual(recovered.error, { code: "agent_failed", retryable: false });
-  const blocked = await (await answer(url, sessionId, { turn: 1, prediction: 5 })).json();
-  assert.deepEqual(blocked.error, { code: "agent_failed", retryable: false });
-  assert.equal(answers, 2, "the exhausted retry must not re-enter the orchestrator");
+  assert.equal(recovered.error, null);
+  assert.equal(recovered.turn, 2);
+  assert.equal(answers, 3);
+  assert.deepEqual(claimedAttempts, [1, 1, 1], "each send is its own first attempt");
+});
+
+test("duplicates waiting behind a failing Turn take it over once, and the learner's next send starts again", { timeout: 5_000 }, async (t) => {
+  const store = memoryStore();
+  const claimedAttempts: number[] = [];
+  const entered = Promise.withResolvers<void>();
+  const gate = Promise.withResolvers<void>();
+  let outage = true;
+  let answers = 0;
+  let claims = 0;
+  // the first run waits inside advance until both duplicates have tried to claim the Turn
+  const advanceWithOutage: Advance = async (state, input, callAgent) => {
+    if ("action" in input && input.action === "start") return advanceStub(state, input, callAgent);
+    if (++answers === 1) {
+      entered.resolve();
+      await gate.promise;
+    }
+    return outage ? { ...state, turn: { ...state.session.lastTurn!, error: { code: "agent_failed", retryable: true } } } : advanceStub(state, input, callAgent);
+  };
+  const callAgentFor: AppOptions["callAgentFor"] = (_session, _user, _turn, turnAttempt) => {
+    if (turnAttempt !== undefined) claimedAttempts.push(turnAttempt);
+    return callAgentStub;
+  };
+  const claimTurn = store.claimTurn.bind(store);
+  t.mock.method(store, "claimTurn", async (...args: Parameters<Store["claimTurn"]>) => {
+    claims++;
+    return claimTurn(...args);
+  });
+  const url = await start(t, { ...noDb, store, advance: advanceWithOutage, callAgentFor });
+  const { sessionId } = await (await post(url, { concept: "democracy" })).json();
+
+  const first = answer(url, sessionId, { turn: 1, prediction: 5 });
+  await entered.promise;
+  const duplicates = [answer(url, sessionId, { turn: 1, prediction: 5 }), answer(url, sessionId, { turn: 1, prediction: 5 })];
+  while (claims < 3) await new Promise((resolve) => setImmediate(resolve));
+  gate.resolve();
+  const replies = await Promise.all([first, ...duplicates].map(async (res) => (await res).json()));
+  for (const reply of replies) assert.deepEqual(reply.error, { code: "agent_failed", retryable: true });
+  assert.equal(answers, 2, "the first run and one takeover: the other duplicate doesn't run the agents again");
   assert.deepEqual(claimedAttempts, [1, 2]);
+
+  outage = false;
+  const next = await (await answer(url, sessionId, { turn: 1, prediction: 5 })).json();
+  assert.equal(next.turn, 2);
+  assert.deepEqual(claimedAttempts, [1, 2, 1]);
 });
 
 test("a waiting request reclaims a crashed Turn once its durable lease expires", async (t) => {
@@ -557,7 +603,7 @@ test("a waiting request reclaims a crashed Turn once its durable lease expires",
   const state = store.turnClaimState.bind(store);
   let polls = 0;
   t.mock.method(store, "turnClaimState", async (...args: Parameters<Store["turnClaimState"]>) => {
-    if (++polls === 1) return { active: true, attempts: 1 };
+    if (++polls === 1) return { active: true };
     store.expireTurnClaim("leo", sessionId, 1);
     return state(...args);
   });

@@ -72,7 +72,7 @@ export type AgentLogEntry = {
 
 /** A move a Turn moved on: the level it reached and the unassisted successes it added (`changedMoves` in app.ts). */
 export type MasteryProgress = { move: MoveId; level: Level; gained: number };
-export type TurnClaimState = { active: boolean; attempts: number };
+export type TurnClaimState = { active: boolean };
 
 export type Store = {
   // Persist an already initialized session in one write; no invisible intermediate row.
@@ -87,8 +87,10 @@ export type Store = {
   // then: a level never drops below the stored one and successes add to the stored count, so a Turn that read mastery
   // before another session saved can't undo that session's progress, and no session moves on without what it earned.
   saveSession(session: Session, previousTurn: number, progress?: readonly MasteryProgress[], claimId?: string): Promise<boolean>;
-  // A database-backed lease admits one handler; the same Turn can be claimed twice total (first run plus one recovery).
-  claimTurn(user: string, sessionId: string, turn: number, claimId: string): Promise<number | null>;
+  // A database-backed lease admits one handler, as attempt 1 of the Turn. A `recovery` claim, from a request that waited
+  // behind that handler, takes over a lease it left unsaved once (attempt 2): duplicates of one send can't keep re-running
+  // a failing Turn, and the learner's next send starts again at attempt 1 (audit, Nov 2).
+  claimTurn(user: string, sessionId: string, turn: number, claimId: string, recovery?: boolean): Promise<number | null>;
   turnClaimState(user: string, sessionId: string, turn: number): Promise<TurnClaimState | null>;
   releaseTurn(user: string, sessionId: string, claimId: string): Promise<void>;
   renewTurnClaim(user: string, sessionId: string, turn: number, claimId: string): Promise<boolean>;
@@ -153,7 +155,8 @@ const SET_SESSION = Object.keys(Session.shape)
   .map((key) => `${key} = $s.${key}`)
   .join(", ");
 
-function sessionRecord(row: Record<string, unknown>) {
+// export-testers.ts reads its rows through this too.
+export function sessionRecord(row: Record<string, unknown>) {
   const session = { ...row };
   // Durable lease metadata belongs to the API store, not the strict learner-session contract.
   for (const field of ["activeTurnClaim", "activeTurnClaimUntil", "turnClaimFor", "turnClaimAttempts"]) delete session[field];
@@ -194,17 +197,17 @@ export function createStore(db: Surreal): Store {
       return session ? sessionRecord(session) : null;
     },
 
-    async claimTurn(user, id, turn, claimId) {
+    async claimTurn(user, id, turn, claimId, recovery = false) {
       const [claimed] = await db
         .query(
           `UPDATE $id SET activeTurnClaim = $claimId, activeTurnClaimUntil = time::now() + 2m,
              turnClaimFor = $turn,
-             turnClaimAttempts = IF turnClaimFor = $turn THEN (turnClaimAttempts ?? 0) + 1 ELSE 1 END
+             turnClaimAttempts = IF $recovery AND turnClaimFor = $turn THEN (turnClaimAttempts ?? 0) + 1 ELSE 1 END
            WHERE user = $user AND turn = $turn
              AND (activeTurnClaim = NONE OR activeTurnClaim = NULL OR activeTurnClaimUntil <= time::now())
-             AND (turnClaimFor != $turn OR (turnClaimAttempts ?? 0) < 2)
+             AND ($recovery = false OR turnClaimFor != $turn OR (turnClaimAttempts ?? 0) < 2)
            RETURN VALUE turnClaimAttempts`,
-          { id: sessionId(id), user, turn, claimId },
+          { id: sessionId(id), user, turn, claimId, recovery },
         )
         .json()
         .retry()
@@ -214,14 +217,12 @@ export function createStore(db: Surreal): Store {
     },
 
     async turnClaimState(user, id, turn) {
-      const row = await one<{ active?: boolean; attempts?: number } | null>(
-        `SELECT (activeTurnClaim != NONE AND activeTurnClaim != NULL AND activeTurnClaimUntil > time::now()) AS active,
-           IF turnClaimFor = $turn THEN turnClaimAttempts ?? 0 ELSE 0 END AS attempts
+      const row = await one<{ active?: boolean } | null>(
+        `SELECT (activeTurnClaim != NONE AND activeTurnClaim != NULL AND activeTurnClaimUntil > time::now()) AS active
          FROM ONLY $id WHERE user = $user AND turn = $turn`,
         { id: sessionId(id), user, turn },
       );
-      if (!row) return null;
-      return { active: row.active === true, attempts: Number.isSafeInteger(row.attempts) ? row.attempts! : 0 };
+      return row ? { active: row.active === true } : null;
     },
 
     async releaseTurn(user, id, claimId) {
