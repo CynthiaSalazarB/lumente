@@ -17,8 +17,8 @@ import { dirname, join, relative, resolve } from "node:path";
 const ENV_FILES = [".env.production.local", ".env.local", ".env.production", ".env"];
 /** Where `expo export` puts the JavaScript: the web chunks (web/*.js) and the Android bundle (android/*.hbc). */
 const JS_DIR = join("_expo", "static", "js");
-const CLERK_KEY = /^pk_(test|live)_[A-Za-z0-9]+$/;
-const ANY_CLERK_KEY = /pk_(test|live)_[A-Za-z0-9]{20,}/;
+const CLERK_KEY = /^pk_(test|live)_[A-Za-z0-9+/_-]+={0,2}$/;
+const ANY_CLERK_KEY = /pk_(test|live)_[A-Za-z0-9+/_-]{20,}={0,2}/;
 /** A deployed build can't reach these: the export was made with a local .env. */
 const LOCAL_HOST = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|\d+\.\d+\.\d+\.\d+)(:\d+)?$/;
 
@@ -78,8 +78,12 @@ function checkExport(dist, { apiUrl, clerkKey }) {
   } else if (!URL.canParse(apiUrl)) {
     problems.push(`EXPO_PUBLIC_API_URL is not a URL: ${apiUrl}`);
   } else {
-    host = new URL(apiUrl).host;
-    if (LOCAL_HOST.test(host)) problems.push(`EXPO_PUBLIC_API_URL points at ${host}, which no phone or browser out there can reach`);
+    const url = new URL(apiUrl);
+    host = url.host;
+    if (url.protocol !== "https:" || url.username || url.password || url.hash) {
+      problems.push("EXPO_PUBLIC_API_URL must use HTTPS without credentials or a fragment for deployment");
+    }
+    if (LOCAL_HOST.test(url.hostname.replace(/\.$/, ""))) problems.push(`EXPO_PUBLIC_API_URL points at ${host}, which no phone or browser out there can reach`);
   }
   if (clerkKey && !CLERK_KEY.test(clerkKey)) problems.push("EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY is not a Clerk publishable key (pk_test_… or pk_live_…)");
 

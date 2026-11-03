@@ -21,44 +21,44 @@ const BROKEN = "The server hit a problem. Try again in a moment.";
 /** A 401: the server's own line names headers and tokens, which mean nothing to a learner. */
 const SIGNED_OUT = "The server didn't accept your sign-in. Sign out, then sign in again.";
 
-/** The server gives each Claude call 30 s and one retry (api/src/server.ts), so one slow turn can take a minute;
- * the app waits a little past that before giving up. An answer sent again after this is judged once: the `turn`
- * number tells the server it already has it (CONTRACTS.md section 1). */
+/** The first request waits for the model path; a turn retry allows the 125 s duplicate wait, a normal 90 s model path,
+ * and 10 s to return. The turn number makes any concurrent resend safe (CONTRACTS.md section 1). */
 const TIMEOUT_MS = 90_000;
+const RECOVERY_TIMEOUT_MS = 225_000;
 
 export function createApiClient({ baseUrl, devUser, devKey, getToken, fetch: send = fetch, timeoutMs = TIMEOUT_MS }: ApiClientOptions): SessionClient {
   const root = baseUrl.replace(/\/+$/, "");
 
   /** One call with the learner's credentials; the answer's body is parsed as JSON when there is one. */
-  async function call(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<{ res: Response; json: unknown }> {
+  async function call(method: "GET" | "POST" | "DELETE", path: string, body?: unknown, idempotencyKey?: string, deadlineMs = timeoutMs): Promise<{ res: Response; json: unknown }> {
     const headers: Record<string, string> = {};
+    if (idempotencyKey !== undefined) headers["Idempotency-Key"] = idempotencyKey;
     if (body !== undefined) headers["content-type"] = "application/json";
-    const token = getToken ? await getToken() : null;
-    if (token) headers.authorization = `Bearer ${token}`;
-    else if (devUser && devKey) {
-      headers["x-dev-user"] = devUser;
-      headers["x-dev-key"] = devKey;
-    }
-
     // AbortController rather than AbortSignal.timeout, which React Native may not have
     const abort = new AbortController();
-    const timer = setTimeout(() => abort.abort(), timeoutMs);
+    let timer: ReturnType<typeof setTimeout>;
+    // One deadline covers credentials, headers and body, even if the underlying operation ignores cancellation.
+    const slow = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        abort.abort();
+        reject(new ClientError(SLOW, null, true));
+      }, deadlineMs);
+    });
     try {
+      const token = getToken ? await Promise.race([getToken(), slow]) : null;
+      if (token) headers.authorization = `Bearer ${token}`;
+      else if (devUser && devKey) {
+        headers["x-dev-user"] = devUser;
+        headers["x-dev-key"] = devKey;
+      }
       let res: Response;
       try {
-        res = await send(`${root}${path}`, { method, headers, ...(body !== undefined ? { body: JSON.stringify(body) } : {}), signal: abort.signal });
+        res = await Promise.race([send(`${root}${path}`, { method, headers, ...(body !== undefined ? { body: JSON.stringify(body) } : {}), signal: abort.signal }), slow]);
       } catch {
         // the timer fired, or the network did: both are worth trying again, and the words say which
         throw new ClientError(abort.signal.aborted ? SLOW : OFFLINE, null, true);
       }
       if (res.status === 204) return { res, json: null };
-      // The timer covers the body too: a body that stalls after the headers ends as a slow answer, even where the
-      // abort doesn't reach a body already on its way.
-      const slow = new Promise<never>((_, reject) => {
-        const fail = () => reject(new ClientError(SLOW, null, true));
-        if (abort.signal.aborted) fail();
-        else abort.signal.addEventListener("abort", fail, { once: true });
-      });
       const read = res.json().catch(() => {
         if (abort.signal.aborted) throw new ClientError(SLOW, null, true);
         return null;
@@ -66,7 +66,7 @@ export function createApiClient({ baseUrl, devUser, devKey, getToken, fetch: sen
       const json: unknown = await Promise.race([read, slow]);
       return { res, json };
     } finally {
-      clearTimeout(timer);
+      clearTimeout(timer!);
     }
   }
 
@@ -79,8 +79,8 @@ export function createApiClient({ baseUrl, devUser, devKey, getToken, fetch: sen
     return new ClientError(words, res.status, res.status === 429 || res.status >= 500);
   };
 
-  async function post(path: string, body: unknown): Promise<Turn> {
-    const { res, json } = await call("POST", path, body);
+  async function post(path: string, body: unknown, idempotencyKey?: string, deadlineMs = timeoutMs): Promise<Turn> {
+    const { res, json } = await call("POST", path, body, idempotencyKey, deadlineMs);
     // A 409 answers with the session's latest Turn (decision 18 and #73), so the app just redraws it.
     if (res.ok || res.status === 409) {
       const turn = Turn.safeParse(json);
@@ -94,8 +94,17 @@ export function createApiClient({ baseUrl, devUser, devKey, getToken, fetch: sen
 
   return {
     offline: false,
-    start: (body: CreateSessionBody) => post("/sessions", body),
-    send: (sessionId: string, body: TurnBody) => post(`/sessions/${encodeURIComponent(sessionId)}/turns`, body),
+    start: (body: CreateSessionBody, idempotencyKey?: string) => post("/sessions", body, idempotencyKey),
+    async send(sessionId: string, body: TurnBody) {
+      const path = `/sessions/${encodeURIComponent(sessionId)}/turns`;
+      try {
+        return await post(path, body);
+      } catch (error) {
+        if (!(error instanceof ClientError) || !error.retryable || (error.status !== null && error.status < 500)) throw error;
+        // The server's durable lease admits one recovery after a lost reply; repeat the exact body once and wait for it.
+        return post(path, body, undefined, RECOVERY_TIMEOUT_MS);
+      }
+    },
     async list() {
       const { res, json } = await call("GET", "/sessions");
       if (!res.ok) throw errorOf(res, json);
@@ -111,11 +120,11 @@ export function createApiClient({ baseUrl, devUser, devKey, getToken, fetch: sen
       return turn.data;
     },
     async transcript(sessionId: string) {
-      const { res, json } = await call("GET", `/sessions/${encodeURIComponent(sessionId)}/transcript`);
+      const { res, json } = await call("GET", `/sessions/${encodeURIComponent(sessionId)}/transcript?material=1`);
       if (!res.ok) throw errorOf(res, json);
       const transcript = Transcript.safeParse(json);
       if (!transcript.success) throw unexpected(res.status);
-      return transcript.data.steps;
+      return transcript.data;
     },
     async deleteData() {
       const { res, json } = await call("DELETE", "/me/data");

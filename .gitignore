@@ -16,6 +16,7 @@ web-build/
 # build output
 build/
 *.tsbuildinfo
+output/playwright/
 
 # OS / editors
 .DS_Store

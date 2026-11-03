@@ -27,6 +27,67 @@ test("the store against a real SurrealDB", { skip: url ? false : "set SURREAL_TE
   await defineSchema(db);
   const store = createStore(db);
 
+  await t.test("start keys survive concurrent API instances and a lost insert acknowledgement", { timeout: 10_000 }, async (st) => {
+    let arrivals = 0;
+    let release!: () => void;
+    const bothInserting = new Promise<void>((resolve) => { release = resolve; });
+    const concurrentStore = {
+      ...store,
+      async insertSession(session: Parameters<typeof store.insertSession>[0]) {
+        if (++arrivals === 2) release();
+        await bothInserting;
+        await store.insertSession(session);
+      },
+    };
+    const serve = async (backing: typeof store) => {
+      const server = createApp({ corsOrigins: [], checkDb: null, store: backing, advance, callAgentFor: () => callAgentStub, userFromToken: null, devKey: "k", memory: null }).listen(0);
+      st.after(() => server.close());
+      await once(server, "listening");
+      return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    };
+    const left = await serve(concurrentStore);
+    const right = await serve(concurrentStore);
+    const headers = { "content-type": "application/json", "x-dev-user": "start-retry", "x-dev-key": "k", "idempotency-key": "concurrent-start" };
+    const start = (api: string, key = headers["idempotency-key"]) => fetch(`${api}/sessions`, { method: "POST", headers: { ...headers, "idempotency-key": key }, body: JSON.stringify({ concept: "API" }) });
+    const responses = await Promise.all([start(left), start(right)]);
+    assert.deepEqual(responses.map((response) => response.status), [201, 201]);
+    const turns = await Promise.all(responses.map((response) => response.json()));
+    assert.deepEqual(turns[0], turns[1]);
+    assert.equal(arrivals, 2); // both processes passed the initial read before either inserted
+    assert.equal((await store.listSessions("start-retry")).length, 1);
+
+    const ambiguous = await serve({
+      ...store,
+      async insertSession(session) {
+        await store.insertSession(session);
+        throw new Error("Database acknowledgement lost after commit");
+      },
+    });
+    const committed = await start(ambiguous, "lost-acknowledgement");
+    assert.equal(committed.status, 201);
+    const first = await committed.json();
+    const restarted = await serve(createStore(db));
+    const replay = await start(restarted, "lost-acknowledgement");
+    assert.equal(replay.status, 201);
+    assert.deepEqual(await replay.json(), first);
+    assert.equal((await store.listSessions("start-retry")).length, 2);
+  });
+
+  await t.test("initialized session insertion is atomic and never replaces an existing session", async () => {
+    const fresh = { ...initialSession("atomic-start", { concept: "API", material: null, mode: "learn" }), id: "atomicstart", createdAt: new Date().toISOString() };
+    const next = await advance({ session: fresh, mastery: await store.getMastery(fresh.user) }, { action: "start" }, callAgentStub);
+    next.session.transcript.push({ body: null, turn: next.turn });
+    await store.insertSession(next.session);
+    const saved = (await store.getSession(fresh.user, fresh.id))!;
+    assert.deepEqual(saved.lastTurn, next.turn);
+    assert.deepEqual(saved.transcript, next.session.transcript);
+    assert.equal((await store.listSessions(fresh.user)).length, 1);
+    await assert.rejects(store.insertSession({ ...next.session, material: "must not overwrite" }));
+    assert.deepEqual(await store.getSession(fresh.user, fresh.id), saved);
+    await assert.rejects(store.insertSession({ ...fresh, id: "invalidstart" }), /matching first Turn/);
+    assert.equal(await store.getSession(fresh.user, "invalidstart"), null);
+  });
+
   await t.test("a session is written, read back by its owner only, and saved once per Turn", async () => {
     const session = await store.createSession("leo", { concept: "democracy", material: null, mode: "learn" });
     assert.match(session.id, /^[a-z0-9]+$/);
@@ -46,6 +107,44 @@ test("the store against a real SurrealDB", { skip: url ? false : "set SURREAL_TE
     // what comes back from the database still fits Cynthia's Session schema, so `advance` can trust it
     assert.doesNotThrow(() => SessionSchema.parse(session));
     assert.doesNotThrow(() => SessionSchema.parse(saved));
+  });
+
+  await t.test("a turn claim admits one owner, can be renewed or reclaimed after expiry, and fences stale saves", async () => {
+    const session = await store.createSession("turn-claim", { concept: "democracy", material: null, mode: "learn" });
+    const claims = await Promise.all([
+      store.claimTurn("turn-claim", session.id, session.turn, "claim-a"),
+      store.claimTurn("turn-claim", session.id, session.turn, "claim-b"),
+    ]);
+    assert.deepEqual([...claims].sort((a, b) => (a ?? 0) - (b ?? 0)), [null, 1]);
+    assert.equal((await store.getSession("turn-claim", session.id))?.turn, 0, "active lease fields stay out of the strict Session contract");
+    const owner = claims[0] === 1 ? "claim-a" : "claim-b";
+    const stale = owner === "claim-a" ? "claim-b" : "claim-a";
+    assert.deepEqual(await store.turnClaimState("turn-claim", session.id, session.turn), { active: true, attempts: 1 });
+    assert.equal(await store.renewTurnClaim("turn-claim", session.id, session.turn, owner), true);
+    assert.equal(await store.renewTurnClaim("turn-claim", session.id, session.turn, stale), false);
+    const next = await advanceStub({ session, mastery: await store.getMastery("turn-claim") }, { action: "start" }, callAgentStub);
+    assert.equal(await store.saveSession(next.session, session.turn), false, "an unclaimed writer cannot clear an active lease");
+
+    await db.query("UPDATE $id SET activeTurnClaimUntil = time::now() - 1s", { id: new RecordId("session", session.id) }).collect();
+    assert.deepEqual(await store.turnClaimState("turn-claim", session.id, session.turn), { active: false, attempts: 1 });
+    assert.equal(await store.claimTurn("turn-claim", session.id, session.turn, "recovered"), 2);
+    assert.deepEqual(await store.turnClaimState("turn-claim", session.id, session.turn), { active: true, attempts: 2 });
+    assert.equal(await store.saveSession(next.session, session.turn, [], owner), false, "an expired owner cannot commit after reclamation");
+    assert.equal(await store.saveSession(next.session, session.turn, [], "recovered"), true);
+    assert.equal(await store.turnClaimState("turn-claim", session.id, session.turn), null, "a saved next Turn has no claim state for the old Turn");
+    assert.equal((await store.getSession("turn-claim", session.id))?.turn, 1);
+    assert.equal(await store.claimTurn("turn-claim", session.id, 1, "next-turn"), 1, "the next Turn gets a fresh first attempt");
+  });
+
+  await t.test("a recovered Turn can only be claimed once, including after a store reconnect", async () => {
+    const session = await store.createSession("turn-retry-limit", { concept: "democracy", material: null, mode: "learn" });
+    const id = new RecordId("session", session.id);
+    assert.equal(await store.claimTurn("turn-retry-limit", session.id, session.turn, "first"), 1);
+    await db.query("UPDATE $id SET activeTurnClaimUntil = time::now() - 1s", { id }).collect();
+    assert.equal(await store.claimTurn("turn-retry-limit", session.id, session.turn, "one-recovery"), 2);
+    await db.query("UPDATE $id SET activeTurnClaimUntil = time::now() - 1s", { id }).collect();
+    assert.deepEqual(await store.turnClaimState("turn-retry-limit", session.id, session.turn), { active: false, attempts: 2 });
+    assert.equal(await createStore(db).claimTurn("turn-retry-limit", session.id, session.turn, "second-recovery"), null);
   });
 
   await t.test("a Turn's progress lands with its session or not at all, never lowers a stored level, and adds to the stored successes", async () => {
@@ -156,13 +255,45 @@ test("the store against a real SurrealDB", { skip: url ? false : "set SURREAL_TE
     assert.deepEqual(await store.finishedConcepts("nobody"), []);
 
     const facts = (...ids: string[]) => ({ memory: { facts: ids.map((id) => ({ id })) } });
-    await store.logAgentCall({ session: api1.id, agent: "hint_giver", input: facts("attr_1", "attr_2"), output: { cites: ["attr_1"] }, ms: 1, usd: 0, dropped: ["attr_x"] });
-    await store.logAgentCall({ session: api2.id, agent: "coach", input: facts("attr_1"), output: {}, ms: 1, usd: 0 });
-    await store.logAgentCall({ session: api2.id, agent: "coach", input: { concept: "API" }, output: {}, ms: 1, usd: 0 });
-    await store.logAgentCall({ session: api1.id, agent: "questioner", input: facts("attr_9"), output: {}, ms: 1, usd: 0 });
-    await store.logAgentCall({ session: theirs.id, agent: "coach", input: facts("attr_8"), output: {}, ms: 1, usd: 0 });
-    const reads = (await store.memoryReads("reader")).sort((a, b) => b.length - a.length);
-    assert.deepEqual(reads, [["attr_1", "attr_2"], ["attr_1"], []]);
+    const entry = (session: string, agent: string, input: unknown = {}, output: unknown = {}) => ({
+      session, agent, input, output, ms: 1, usd: 0, callId: "test-call", attempt: 1,
+      outcome: "success" as const, costStatus: "measured" as const,
+    });
+    const pending = {
+      ...entry(api1.id, "coach", facts("in_flight_fact"), { status: "in_flight" }),
+      user: "reader", ms: 0, usd: 0.324, callId: "pending-call", turn: 2, turnAttempt: 2,
+      outcome: "started" as const, costStatus: "reserved" as const,
+    };
+    const pendingId = await store.beginAgentCall(pending);
+    assert.equal((await store.memoryReads("reader")).some((ids) => ids.includes("in_flight_fact")), false);
+    await store.finishAgentCall(pendingId, {
+      ...pending, output: { question: "Which group?" }, ms: 12, usd: 0.014, outcome: "success", costStatus: "measured",
+    });
+    const finalizedRows = await db.query(
+      "SELECT callId, attempt, turn, turnAttempt, outcome, costStatus, usd FROM agent_log WHERE id = $id",
+      { id: new RecordId("agent_log", pendingId) },
+    ).collect<[{ callId: string; attempt: number; turn: number; turnAttempt: number; outcome: string; costStatus: string; usd: number }[]]>();
+    assert.deepEqual(finalizedRows[0], [{ callId: "pending-call", attempt: 1, turn: 2, turnAttempt: 2, outcome: "success", costStatus: "measured", usd: 0.014 }]);
+    await store.logAgentCall({ ...entry(api1.id, "hint_giver", facts("attr_1", "attr_2"), { cites: ["attr_1"] }), dropped: ["attr_x"] });
+    await store.logAgentCall(entry(api2.id, "coach", facts("attr_1")));
+    await store.logAgentCall(entry(api2.id, "coach", { concept: "API" }));
+    await store.logAgentCall(entry(api1.id, "questioner", facts("attr_9")));
+    await store.logAgentCall(entry(theirs.id, "coach", facts("attr_8")));
+    for (const [attempt, costStatus, usd] of [[1, "reserved", 0.324], [2, "measured", 0.014]] as const) {
+      await store.logAgentCall({
+        session: api1.id, user: "reader", agent: "questioner", input: {}, output: { error: "agent_failed" }, ms: 1, usd,
+        callId: "retry-call", attempt, turn: 3, turnAttempt: 2, outcome: attempt === 1 ? "failed" : "success", costStatus,
+      });
+    }
+    const attemptRows = await db.query(
+      "SELECT callId, attempt, turn, turnAttempt, outcome, costStatus, usd FROM agent_log WHERE callId = 'retry-call' ORDER BY attempt",
+    ).collect<[{ callId: string; attempt: number; turn: number; turnAttempt: number; outcome: string; costStatus: string; usd: number }[]]>();
+    assert.deepEqual(attemptRows[0], [
+      { callId: "retry-call", attempt: 1, turn: 3, turnAttempt: 2, outcome: "failed", costStatus: "reserved", usd: 0.324 },
+      { callId: "retry-call", attempt: 2, turn: 3, turnAttempt: 2, outcome: "success", costStatus: "measured", usd: 0.014 },
+    ]);
+    const reads = (await store.memoryReads("reader")).sort((a, b) => b.length - a.length || a.join().localeCompare(b.join()));
+    assert.deepEqual(reads, [["attr_1", "attr_2"], ["attr_1"], ["in_flight_fact"], []]);
     const [dropped] = await db.query("SELECT VALUE dropped FROM agent_log WHERE agent = 'hint_giver'").collect<[string[][]]>();
     assert.deepEqual(dropped, [["attr_x"]]);
     // the delete test below counts the whole agent_log table
@@ -183,10 +314,14 @@ test("the store against a real SurrealDB", { skip: url ? false : "set SURREAL_TE
 
   await t.test("Delete my data removes the agent_log rows that name the learner, their session gone or not (code review, Oct 28)", async () => {
     const mine = await store.createSession("orphan", { concept: "API", material: null, mode: "learn" });
-    await store.logAgentCall({ session: mine.id, user: "orphan", agent: "coach", input: {}, output: {}, ms: 1, usd: 0 });
+    const entry = (session: string, user: string) => ({
+      session, user, agent: "coach", input: {}, output: {}, ms: 1, usd: 0, callId: "test-call", attempt: 1,
+      outcome: "success" as const, costStatus: "measured" as const,
+    });
+    await store.logAgentCall(entry(mine.id, "orphan"));
     // rows that landed after their session went: a write the API stopped waiting for, applied late
-    await store.logAgentCall({ session: "gone0000000000000000", user: "orphan", agent: "evaluator", input: {}, output: {}, ms: 1, usd: 0 });
-    await store.logAgentCall({ session: "gone0000000000000001", user: "stays", agent: "evaluator", input: {}, output: {}, ms: 1, usd: 0 });
+    await store.logAgentCall({ ...entry("gone0000000000000000", "orphan"), agent: "evaluator" });
+    await store.logAgentCall({ ...entry("gone0000000000000001", "stays"), agent: "evaluator" });
     await store.deleteUserData("orphan");
     const [left] = await db.query("SELECT VALUE user FROM agent_log WHERE user IN ['orphan', 'stays']").collect<[string[]]>();
     assert.deepEqual(left, ["stays"]);
@@ -195,7 +330,10 @@ test("the store against a real SurrealDB", { skip: url ? false : "set SURREAL_TE
 
   await t.test("deleting a user's data removes their sessions, logs and mastery, and nobody else's", async () => {
     const mine = await store.createSession("delete-me", { concept: "inflation", material: "notes", mode: "test" });
-    await store.logAgentCall({ session: mine.id, agent: "fact_desk", input: { q: 1 }, output: { a: 2 }, ms: 120.4, usd: 0.0123 });
+    await store.logAgentCall({
+      session: mine.id, agent: "fact_desk", input: { q: 1 }, output: { a: 2 }, ms: 120.4, usd: 0.0123,
+      callId: "test-call", attempt: 1, outcome: "success", costStatus: "measured",
+    });
     await store.saveMastery("delete-me", await store.getMastery("delete-me"));
     const theirs = await store.createSession("keep-me", { concept: "inflation", material: null, mode: "learn" });
 

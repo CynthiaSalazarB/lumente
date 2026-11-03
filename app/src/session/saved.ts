@@ -25,16 +25,18 @@ export function savedOf(state: SessionState): SavedSession | null {
 
 /** The guided answer to keep: the words typed and not sent, or else an answer that was sent and failed. The server never
  * got that one and the failure note says it's saved, so a pick-up puts it back in the field (code review, Oct 28). */
-function unsentAnswerOf({ answer, failure, turn }: SessionState): Unsent | null {
+function unsentAnswerOf({ answer, failure, pending, turn }: SessionState): Unsent | null {
   if (answer) return answer;
-  return failure && turn && "text" in failure.body ? { move: partOf(turn), text: failure.body.text } : null;
+  const body = pending ?? failure?.body;
+  return body && turn && "text" in body ? { move: partOf(turn), text: body.text, turn: body.turn } : null;
 }
 
 function unsentOf(value: unknown): Unsent | null {
   if (!value || typeof value !== "object") return null;
-  const { move, text } = value as Record<string, unknown>;
+  const { move, text, turn } = value as Record<string, unknown>;
   if (typeof text !== "string" || !text.trim() || (move !== null && !MoveId.safeParse(move).success)) return null;
-  return { move: move as MoveId | null, text };
+  if (turn !== undefined && (typeof turn !== "number" || !Number.isSafeInteger(turn) || turn < 1)) return null;
+  return { move: move as MoveId | null, text, ...(turn === undefined ? {} : { turn: turn as number }) };
 }
 
 /** The records an entry holds: one (an entry per session, since Oct 27), the list every session shared before (since
@@ -73,7 +75,7 @@ export type SavedSessions = {
   ids: () => Promise<Set<string>>;
   get: (sessionId: string) => Promise<SavedSession | null>;
   keep: (sessionId: string, record: SavedSession | null) => Promise<void>;
-  prune: (knownIds: ReadonlySet<string>, unfinishedIds: ReadonlySet<string>) => Promise<void>;
+  prune: (knownIds: ReadonlySet<string>, finishedIds: ReadonlySet<string>) => Promise<void>;
   clear: () => Promise<void>;
 };
 
@@ -116,9 +118,9 @@ export function createSavedSessions(storage: SavedSessionStorage): SavedSessions
       return parseSaved(await storage.read(sessionId)).find((record) => record.sessionId === sessionId) ?? null;
     },
     keep: (sessionId, record) => update(() => (record ? storage.write(sessionId, JSON.stringify(record)) : storage.remove(sessionId))),
-    prune: (knownIds, unfinishedIds) =>
+    prune: (knownIds, finishedIds) =>
       update(async () => {
-        for (const id of await storage.ids()) if (knownIds.has(id) && !unfinishedIds.has(id)) await storage.remove(id);
+        for (const id of await storage.ids()) if (knownIds.has(id) && finishedIds.has(id)) await storage.remove(id);
       }),
     clear: () =>
       update(async () => {

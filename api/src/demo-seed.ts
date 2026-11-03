@@ -33,7 +33,7 @@ async function main(user: string | undefined): Promise<number> {
     console.error("SURREAL_URL is unset: set the SURREAL_* variables for the database to seed");
     return 2;
   }
-  const db = connectSurreal(config);
+  const db = await connectSurreal(config);
   try {
     // the tables the API defines at startup, in case it hasn't started against this database yet
     await defineSchema(db);

@@ -9,6 +9,32 @@ import { blankMap, drafted, failed, initialState, received, sent, startedWith, t
 
 const turns = sessionOne.map((step) => Turn.parse(step.turn));
 const first = turns[0]!;
+
+test("explicitly clearing a definitely rejected answer removes its recovery copy", () => {
+  const asking = turns.find((turn) => turn.expects === "text")!;
+  const body = { turn: asking.turn, text: "Remove this" };
+  const lost = failed(sent(startedWith(asking), body), body, "Rejected", false);
+  const cleared = typed(lost, asking.sessionId, asking.move, "", true);
+  assert.equal(savedOf(cleared), null);
+});
+
+test("a truncated session list cannot delete an older draft", async () => {
+  const { storage } = memoryStorage();
+  const cache = createSavedSessions(storage);
+  const old = record("older", null, { answer: { move: null, text: "still unfinished" } });
+  await cache.keep("older", old);
+  await cache.prune(await cache.ids(), new Set());
+  assert.deepEqual(await cache.get("older"), old);
+});
+
+test("pending text survives a reload until the server acknowledges its Turn", () => {
+  const asking = turns.find((turn) => turn.expects === "text")!;
+  const body = { turn: asking.turn, text: "Keep my answer until acknowledged" };
+  const kept = savedOf(sent(startedWith(asking), body));
+  assert.equal(kept?.answer?.text, body.text);
+  assert.equal((kept?.answer as { turn?: number })?.turn, asking.turn);
+  assert.deepEqual(parseSaved(JSON.stringify(kept))[0]?.answer, kept?.answer);
+});
 const record = (sessionId: string, material: string | null = null, extra: Partial<SavedSession> = {}): SavedSession => ({ sessionId, material, draft: null, answer: null, ...extra });
 
 test("a session on screen is kept with its notes; one that is over, none at all, or one with nothing to keep, is not", () => {
@@ -49,23 +75,32 @@ test("a guided answer typed and not sent goes with the record, even with no note
   }
 });
 
-test("an answer that was sent and failed stays with the record until it goes again, so a pick-up brings it back (code review, Oct 28)", () => {
+test("an answer with an uncertain server outcome stays with the record until retry or resume (code review, Oct 28)", () => {
   const asking = turns.find((turn) => turn.expects === "text" && turn.phase === "move")!;
   const body = { turn: asking.turn, text: "a kind of government" };
-  const kept = { move: asking.move, text: "a kind of government" };
+  const kept = { move: asking.move, text: "a kind of government", turn: asking.turn };
   const sending = sent(startedWith(asking), body);
-  // on its way, the server may have it already: nothing is kept for it
-  assert.equal(savedOf(sending), null);
+  // Keep it until acknowledgement; its Turn number prevents restoring an answer already saved by the server.
+  assert.deepEqual(savedOf(sending)?.answer, kept);
   // failed before a Turn came back: the server never got it, so it is kept as the part's unsent answer
   const lost = failed(sending, body, "No connection.", true);
   assert.deepEqual(savedOf(lost), record(asking.sessionId, null, { answer: kept }));
   // an agent's failure (an error Turn) keeps it the same way
   assert.deepEqual(savedOf(received(sending, { ...asking, error: { code: "agent_failed", retryable: true } }))?.answer, kept);
-  // the answer field, emptied by Send, can't drop it; words typed since are what the field shows, so they win
+  // The answer field is locked during retry; an accidental edit can't replace a body the server may have accepted.
   assert.deepEqual(savedOf(typed(lost, asking.sessionId, asking.move, ""))?.answer, kept);
-  assert.deepEqual(savedOf(typed(lost, asking.sessionId, asking.move, "a newer answer"))?.answer, { move: asking.move, text: "a newer answer" });
+  assert.deepEqual(savedOf(typed(lost, asking.sessionId, asking.move, "a newer answer", true))?.answer, kept);
   // sent again, it is on its way once more
-  assert.equal(savedOf(sent(lost, body, true)), null);
+  assert.deepEqual(savedOf(sent(lost, body, true))?.answer, kept);
+});
+
+test("a definitely rejected answer becomes editable and clears when the learner changes it", () => {
+  const asking = turns.find((turn) => turn.expects === "text")!;
+  const body = { turn: asking.turn, text: "Rejected body" };
+  const rejected = failed(sent(startedWith(asking), body), body, "The server rejected this answer.", false);
+  const edited = typed(rejected, asking.sessionId, asking.move, "Replacement", true);
+  assert.equal(edited.failure, null);
+  assert.deepEqual(savedOf(edited)?.answer, { move: asking.move, text: "Replacement" });
 });
 
 test("anything that isn't a record reads back as nothing; the list kept before Oct 27 and the one record before Oct 24 read as records", () => {
@@ -196,7 +231,7 @@ test("pruning on a session list keeps the unfinished sessions and the ones creat
   const atRequest = await cache.ids();
   const startedWhileLoading = record("ses_new", "notes");
   await cache.keep(startedWhileLoading.sessionId, startedWhileLoading);
-  await cache.prune(atRequest, new Set(["ses_going"]));
+  await cache.prune(atRequest, new Set(["ses_done"]));
   assert.deepEqual(await cache.ids(), new Set(["ses_going", "ses_new"]));
 });
 

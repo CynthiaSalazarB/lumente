@@ -9,8 +9,10 @@ import { AGENTS, type AgentContext, type AgentName } from "@build-north/agents";
 import {
   AgentCallError,
   agentConfigFromEnv,
+  countInputTokensWith,
   createCallAgent,
   sendWith,
+  type CountClaudeInputTokens,
   type ClaudeReply,
   type SendToClaude,
 } from "./call-agent.ts";
@@ -26,27 +28,50 @@ const context: AgentContext = {
   recent: [],
 };
 const question = { question: "Democracy is one example of a bigger group. What group?", scaffold: null };
+
+test("the spend guard requires a finite positive budget", () => {
+  for (const value of ["Infinity", "1e999", "NaN", "0", "-1", " "]) {
+    assert.throws(() => agentConfigFromEnv({ ANTHROPIC_API_KEY: "test", AGENT_BUDGET_USD: value }), /AGENT_BUDGET_USD/);
+  }
+  assert.equal(agentConfigFromEnv({ ANTHROPIC_API_KEY: "test", AGENT_BUDGET_USD: "0.25" })?.budgetUsd, 0.25);
+});
 // $0.014 on claude-opus-5-5: 1,000 input tokens at $4 a million plus 500 output tokens at $20
 const usage = { input_tokens: 1_000, output_tokens: 500, cache_creation_input_tokens: null, cache_read_input_tokens: null };
 
 type Block = { type: string; text?: string };
 const answer = (value: unknown): Block[] => [{ type: "text", text: JSON.stringify(value) }];
-const reply = (content: Block[], { stop_reason = "end_turn", headers = {} } = {}): ClaudeReply => ({
-  message: { content, stop_reason, usage },
+const reply = (content: Block[], { stop_reason = "end_turn", headers = {}, tokens = usage } = {}): ClaudeReply => ({
+  message: { content, stop_reason, usage: tokens },
   headers: new Headers(headers),
 });
 const failsWith = (code: AgentCallError["code"], retryable: boolean) => (error: unknown) =>
   error instanceof AgentCallError && error.code === code && error.retryable === retryable;
 
-function setup(send: SendToClaude, budgetUsd = 10) {
+function setup(
+  send: SendToClaude,
+  budgetUsd = 10,
+  countInputTokens: CountClaudeInputTokens = async () => 1_000,
+  turnContext?: { turn: number; turnAttempt: number },
+) {
   const logged: AgentLogEntry[] = [];
+  const log = {
+    async begin(entry: AgentLogEntry) {
+      const id = String(logged.length);
+      logged.push(entry);
+      return id;
+    },
+    async finish(id: string, entry: AgentLogEntry) {
+      logged[Number(id)] = entry;
+    },
+  };
   const callAgentFor = createCallAgent({
     send,
+    countInputTokens,
     model: "claude-opus-5-5",
     budgetUsd,
-    log: async (entry) => void logged.push(entry),
+    log,
   });
-  return { callAgent: callAgentFor("s1"), logged };
+  return { callAgent: callAgentFor("s1", "learner", turnContext?.turn, turnContext?.turnAttempt), logged };
 }
 
 test("a call sends the agent's prompt, the message its render writes, and its effort, and logs what came back", async () => {
@@ -68,18 +93,152 @@ test("a call sends the agent's prompt, the message its render writes, and its ef
   assert.equal(logged[0]?.usd, 0.014);
 });
 
-test("calls stop at 95% of the budget, with a rate_limited error that a retry can't fix", async (t) => {
+test("the agent log ties every paid retry to its durable Turn attempt", async (t) => {
+  t.mock.method(console, "error", () => {});
+  let sends = 0;
+  const { callAgent, logged } = setup(async () => {
+    if (++sends === 1) throw new Anthropic.APIConnectionTimeoutError();
+    return reply(answer(question));
+  }, 10, async () => 1_000, { turn: 4, turnAttempt: 2 });
+  assert.deepEqual(await callAgent("questioner", context), question);
+  assert.deepEqual(logged.map(({ turn, turnAttempt, attempt, outcome }) => [turn, turnAttempt, attempt, outcome]), [
+    [4, 2, 1, "failed"],
+    [4, 2, 2, "success"],
+  ]);
+});
+
+test("does not send a paid request when the attempt cannot be durably logged", async (t) => {
+  t.mock.method(console, "error", () => {});
+  let sends = 0;
+  const callAgent = createCallAgent({
+    send: async () => {
+      sends++;
+      return reply(answer(question));
+    },
+    countInputTokens: async () => 1_000,
+    model: "claude-opus-5-5",
+    budgetUsd: 10,
+    log: {
+      begin: async () => { throw new Error("database unavailable"); },
+      finish: async () => {},
+    },
+  })("s1");
+
+  await assert.rejects(callAgent("questioner", context), failsWith("agent_failed", false));
+  assert.equal(sends, 0, "a provider call must not go out without an agent_log reservation");
+});
+
+test("a failed log finalization leaves its conservative reservation and keeps the reply usable", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const logged: AgentLogEntry[] = [];
+  const callAgent = createCallAgent({
+    send: async () => reply(answer(question)),
+    countInputTokens: async () => 1_000,
+    model: "claude-opus-5-5",
+    budgetUsd: 10,
+    log: {
+      async begin(entry) { logged.push(entry); return "row-1"; },
+      async finish() { throw new Error("database unavailable"); },
+    },
+  })("s1");
+
+  assert.deepEqual(await callAgent("questioner", context), question);
+  assert.equal(logged.length, 1);
+  assert.equal(logged[0]?.outcome, "started");
+  assert.equal(logged[0]?.costStatus, "reserved");
+  assert.ok(logged[0]!.usd > 0.014, "the unsettled row keeps a conservative maximum, not measured usage");
+});
+
+test("malformed provider usage keeps its reservation and cannot poison later budget checks", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const messages: Record<string, unknown>[] = [];
+  let providerUsage: unknown = null;
+  const server = createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    if (req.url === "/v1/messages/count_tokens") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ input_tokens: 1_000 }));
+      return;
+    }
+    messages.push(JSON.parse(body) as Record<string, unknown>);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      id: "msg_invalid_usage", type: "message", role: "assistant", model: "claude-opus-5-5",
+      content: [{ type: "text", text: JSON.stringify(question) }], stop_reason: "end_turn", stop_sequence: null,
+      usage: providerUsage,
+    }));
+  });
+  server.listen(0);
+  t.after(() => server.close());
+  await once(server, "listening");
+  const client = new Anthropic({ apiKey: "test-key", baseURL: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, maxRetries: 0 });
+  const malformedUsage: unknown[] = [
+    null,
+    { output_tokens: 500 },
+    { input_tokens: 1_000, output_tokens: -1 },
+    { input_tokens: 1_000.5, output_tokens: 500 },
+    { input_tokens: 1_000, output_tokens: 500, cache_creation_input_tokens: "500" },
+    { input_tokens: 1_000, output_tokens: 500, cache_read_input_tokens: 0.5 },
+  ];
+
+  for (const usageCase of malformedUsage) {
+    providerUsage = usageCase;
+    const before = messages.length;
+    const { callAgent, logged } = setup(sendWith(client), 0.25, countInputTokensWith(client));
+    assert.deepEqual(await callAgent("questioner", context), question);
+    assert.equal(logged[0]?.outcome, "success");
+    assert.ok(Number.isFinite(logged[0]?.usd), `reservation must stay finite for usage ${JSON.stringify(usageCase)}`);
+    assert.equal(logged[0]?.costStatus, "reserved");
+    assert.ok((logged[0]?.usd ?? 0) > 0, "unknown usage must retain its pre-call reservation");
+    await assert.rejects(callAgent("questioner", context), failsWith("rate_limited", false));
+    assert.equal(messages.length, before + 1, "the conservative reservation must keep a second paid request out");
+  }
+});
+
+test("budget admission reserves in-flight cost and limits output tokens near the cap", async (t) => {
   t.mock.method(console, "error", () => {});
   let calls = 0;
-  // $0.02 budget: the first call ($0.014) is under its 95%, the second takes it over
-  const { callAgent } = setup(async () => {
+  const { callAgent } = setup(async (params) => {
     calls++;
-    return reply(answer(question));
+    return reply(answer(question), { tokens: { ...usage, output_tokens: Math.min(usage.output_tokens, params.max_tokens) } });
   }, 0.02);
   await callAgent("questioner", context);
   await callAgent("questioner", context);
   await assert.rejects(callAgent("questioner", context), failsWith("rate_limited", false));
   assert.equal(calls, 2);
+});
+
+test("concurrent calls reserve the shared process budget before either request is sent", async (t) => {
+  t.mock.method(console, "error", () => {});
+  let calls = 0;
+  const held = Promise.withResolvers<void>();
+  const firstSent = Promise.withResolvers<void>();
+  const { callAgent } = setup(async () => {
+    calls++;
+    firstSent.resolve();
+    await held.promise;
+    return reply(answer(question));
+  }, 0.02);
+  const first = callAgent("questioner", context);
+  await firstSent.promise;
+  await assert.rejects(callAgent("questioner", context), failsWith("rate_limited", false));
+  assert.equal(calls, 1);
+  held.resolve();
+  await first;
+});
+
+test("a retry is refused when the first ambiguous attempt's reservation leaves insufficient budget", async (t) => {
+  t.mock.method(console, "error", () => {});
+  let calls = 0;
+  const { callAgent, logged } = setup(async () => {
+    calls++;
+    throw new Anthropic.APIConnectionTimeoutError();
+  }, 0.6);
+  await assert.rejects(callAgent("questioner", context), failsWith("rate_limited", false));
+  assert.equal(calls, 1);
+  assert.deepEqual(logged.map((entry) => [entry.attempt, entry.costStatus]), [[1, "reserved"]]);
+  assert.ok(logged[0]!.usd > 0);
 });
 
 test("while a rate-limit window is 95% used, calls wait for it to refill", async (t) => {
@@ -108,6 +267,7 @@ test("Claude's errors become agent errors that say whether a retry can help", as
   t.mock.method(console, "error", () => {});
   const cases: [Error, AgentCallError["code"], boolean][] = [
     [Anthropic.APIError.generate(429, { type: "error" }, "rate limited", new Headers()), "rate_limited", true],
+    [Anthropic.APIError.generate(429, { type: "error" }, "do not retry", new Headers({ "x-should-retry": "false" })), "rate_limited", false],
     [Anthropic.APIError.generate(529, { type: "error" }, "overloaded", new Headers()), "agent_failed", true],
     [new Anthropic.APIConnectionTimeoutError(), "agent_failed", true],
     [Anthropic.APIError.generate(400, { type: "error" }, "bad request", new Headers()), "agent_failed", false],
@@ -117,11 +277,14 @@ test("Claude's errors become agent errors that say whether a retry can help", as
       throw thrown;
     });
     await assert.rejects(callAgent("questioner", context), failsWith(code, retryable), thrown.message);
-    assert.equal(logged.length, 0);
+    assert.equal(logged.length, retryable ? 2 : 1);
+    assert.deepEqual(logged.map((entry) => entry.attempt), retryable ? [1, 2] : [1]);
+    assert.equal(new Set(logged.map((entry) => entry.callId)).size, 1);
+    assert.equal(logged[0]?.costStatus, thrown instanceof Anthropic.APIError && !(thrown instanceof Anthropic.APIConnectionError) ? "not_charged" : "reserved");
   }
 });
 
-test("a refusal fails for good; a reply cut off or off the schema can be retried; neither is logged", async (t) => {
+test("refusal and invalid structured replies are logged with measured usage", async (t) => {
   t.mock.method(console, "error", () => {});
   const refused = setup(async () => reply([], { stop_reason: "refusal" }));
   await assert.rejects(refused.callAgent("questioner", context), failsWith("agent_failed", false));
@@ -129,13 +292,16 @@ test("a refusal fails for good; a reply cut off or off the schema can be retried
   await assert.rejects(cutOff.callAgent("questioner", context), failsWith("agent_failed", true));
   const offSchema = setup(async () => reply(answer({ question: 5, scaffold: null })));
   await assert.rejects(offSchema.callAgent("questioner", context), failsWith("agent_failed", true));
-  assert.equal(refused.logged.length + cutOff.logged.length + offSchema.logged.length, 0);
+  assert.equal(refused.logged.length + cutOff.logged.length + offSchema.logged.length, 3);
+  assert.deepEqual([refused.logged[0]?.costStatus, cutOff.logged[0]?.costStatus, offSchema.logged[0]?.costStatus], ["measured", "measured", "measured"]);
 });
 
 test("a reply that failed still counts against the budget, since it was billed", async (t) => {
   t.mock.method(console, "error", () => {});
   // $0.01 budget: one billed $0.014 reply, even one that broke the schema, spends it
-  const { callAgent } = setup(async () => reply(answer({ question: 5, scaffold: null })), 0.01);
+  const { callAgent } = setup(async (params) => reply(answer({ question: 5, scaffold: null }), {
+    tokens: { ...usage, output_tokens: Math.min(usage.output_tokens, params.max_tokens) },
+  }), 0.01);
   await assert.rejects(callAgent("questioner", context), failsWith("agent_failed", true));
   await assert.rejects(callAgent("questioner", context), failsWith("rate_limited", false));
 });
@@ -153,19 +319,29 @@ test("an agent that isn't in the registry yet, or an input that breaks its schem
   assert.equal(calls, 0);
 });
 
-test("through the real SDK: the request carries the schema, and the rate-limit headers are read", async (t) => {
+test("through the real SDK: input tokens are counted, the request carries the schema, and rate-limit headers are read", async (t) => {
   t.mock.method(console, "error", () => {});
   const bodies: Record<string, unknown>[] = [];
+  const countBodies: Record<string, unknown>[] = [];
   let status = 200;
-  // A stand-in for Anthropic's /v1/messages, so the SDK's own request and response handling runs
+  // A stand-in for Anthropic's Messages and token-count endpoints, so the SDK request handling runs.
   const server = createServer(async (req, res) => {
     let body = "";
     for await (const chunk of req) body += chunk;
-    bodies.push(JSON.parse(body));
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    if (req.url === "/v1/messages/count_tokens") {
+      countBodies.push(parsed);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ input_tokens: 1_000 }));
+      return;
+    }
+    bodies.push(parsed);
+    const retryAfter = status === 429 ? { "retry-after": "0.001" } : {};
     res.writeHead(status, {
       "content-type": "application/json",
+      ...retryAfter,
       "anthropic-ratelimit-requests-limit": "50",
-      "anthropic-ratelimit-requests-remaining": "2",
+      "anthropic-ratelimit-requests-remaining": status === 429 ? "50" : "2",
       "anthropic-ratelimit-requests-reset": new Date(Date.now() + 60_000).toISOString(),
     });
     res.end(
@@ -188,20 +364,23 @@ test("through the real SDK: the request carries the schema, and the rate-limit h
   await once(server, "listening");
   const client = new Anthropic({ apiKey: "test-key", baseURL: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, maxRetries: 0 });
 
-  const { callAgent } = setup(sendWith(client));
+  const { callAgent } = setup(sendWith(client), 10, countInputTokensWith(client));
   assert.deepEqual(await callAgent("questioner", context), question);
   const sent = bodies[0] as { model: string; system: string; output_config: { effort: string; format: { type: string; schema: unknown } } };
   assert.equal(sent.model, "claude-opus-5-5");
   assert.equal(sent.system, AGENTS.questioner.system);
   assert.equal(sent.output_config.effort, AGENTS.questioner.effort);
   assert.equal(sent.output_config.format.type, "json_schema");
+  assert.equal(countBodies.length, 1);
+  assert.equal(countBodies[0]?.system, AGENTS.questioner.system);
   // that reply left the requests window 96% used, so the next call waits without reaching the server
   await assert.rejects(callAgent("questioner", context), failsWith("rate_limited", true));
   assert.equal(bodies.length, 1);
 
   status = 429;
-  const fresh = setup(sendWith(client));
+  const fresh = setup(sendWith(client), 10, countInputTokensWith(client));
   await assert.rejects(fresh.callAgent("questioner", context), failsWith("rate_limited", true));
+  assert.equal(bodies.length, 3, "a single explicit retry should produce two visible Messages requests");
 });
 
 test("every agent's output schema converts to a structured-output format", () => {

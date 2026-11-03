@@ -32,14 +32,14 @@ local files with their `.ts` extension, and use `import type` for types. The typ
 |---|---|
 | `GET /health` | `{ ok: true, commit, memory }`: Render's health check (never touches the database), plus the running commit (Render's `RENDER_GIT_COMMIT`, 7 characters; `null` locally) and `"on"` or `"off"` for Agent Memory, so a deploy and the flag can be checked with one request |
 | `GET /health/db` | Asks SurrealDB for its clock and returns it with how many milliseconds that took. Read-only. `503` when the database is not configured, refuses the login or takes over 5 s; the cause goes to the server log, not the response |
-| `POST /sessions` | `{ concept, material?, mode? }`: saves a new session and returns its first `Turn`, the prediction question. `mode: "test"` (the testers' pre-test and post-test) puts every move at level 5: after the prediction the learner asks the fact desk with `{ question }` and builds the whole map, and the session never writes mastery. `400` for a bad body, `413` for notes over 8,000 characters |
+| `POST /sessions` | `{ concept, material?, mode? }`: atomically saves an initialized session and returns `201` with its first `Turn`, the prediction question. Optional `Idempotency-Key` (1–128 letters, digits, underscores or hyphens) replays that first Turn for the same learner and normalized body while the session exists, including concurrent API instances and restarts; changed input with the same key returns `409` with `{ error }`. Without a key, each request creates a session. `mode: "test"` (the testers' pre-test and post-test) puts every move at level 5: after the prediction the learner asks the fact desk with `{ question }` and builds the whole map, and the session never writes mastery. `400` for a bad body or key, `413` for notes over 8,000 characters |
 | `GET /sessions` | `{ sessions: SessionSummary[] }`: the caller's sessions that have a `Turn`, newest first, each with its concept, mode, date, whether it is finished and, once it is, its score and prediction. Start lists the unfinished ones to pick up and the finished ones under "Your maps" |
 | `GET /sessions/:id` | The session's latest `Turn`: Resume on Start reads it after a reload or a killed app (#137), and "Your maps" opens a finished session with it (its result Turn, read-only). `404` if it doesn't exist or belongs to someone else |
-| `GET /sessions/:id/transcript` | `{ steps }`: every saved step of the session, oldest first, each the body the learner sent (`null` for the start) and the `Turn` it got, so the app shows a picked-up session or a reopened map with its whole conversation. `[]` for a session saved before Oct 25. `404` like `GET /sessions/:id` |
-| `POST /sessions/:id/turns` | One of the bodies in CONTRACTS.md section 1, plus `turn`, the number of the `Turn` it answers. Returns the next `Turn`. An answer to an older `Turn` gets the latest one back and runs nothing; two copies of the same answer arriving at once both run, and the one that saves first is the one that counts. A `Turn` with `error` saves nothing, and neither does a `Turn` that doesn't fit the contract (checked with the `Turn` schema before the save): the answer is then the latest `Turn` with `error` set (`agent_failed`, retryable), the reason goes to the server log, and the retry runs the agents again. Mastery is written only for the moves the `Turn` changed, never for a test session. `400` for a bad body, `404` if the session doesn't exist or belongs to someone else (both with `{ error }`). `409` with the latest `Turn` for a `turn` from the future or a body the latest `Turn` doesn't ask for; the reason goes to the server log |
+| `GET /sessions/:id/transcript` | `{ steps }`: every saved step of the session, oldest first, each the body the learner sent (`null` for the start) and the `Turn` it got, so the app shows a picked-up session or a reopened map with its whole conversation. `?material=1` also returns the session's original notes for recovery. `[]` for a session saved before Oct 25. `404` like `GET /sessions/:id` |
+| `POST /sessions/:id/turns` | One of the bodies in CONTRACTS.md section 1, plus `turn`, the number of the `Turn` it answers. Returns the next `Turn`. An answer to an older `Turn` gets the latest one back and runs nothing. After a retryable transport failure or 5xx, the client automatically resends the exact same Turn once with a 225 s recovery deadline. A database-backed lease admits one handler for a session/turn across API instances; a duplicate waits up to 125 s, then returns the saved Turn, reclaims one expired lease, or returns `503` while the handler remains active. The lease expires after 2 min without renewal. The same Turn can be claimed twice total: the original handler and one recovery after a crash. A stale owner cannot save after another claim replaces it; agent log rows record the Turn and handler attempt. Once both claims are used, another request returns the latest Turn with `agent_failed` and `retryable: false` without calling an agent. A `Turn` with `error` saves nothing, and neither does a `Turn` that doesn't fit the contract (checked with the `Turn` schema before the save): the answer is then the latest `Turn` with `error` set (`agent_failed`, retryable), the reason goes to the server log, and one later retry can run the agents again. Mastery is written only for the moves the `Turn` changed, never for a test session. `400` for a bad body, `404` if the session doesn't exist or belongs to someone else (both with `{ error }`). `409` with the latest `Turn` for a `turn` from the future or a body the latest `Turn` doesn't ask for; the reason goes to the server log |
 | `GET /me/mastery` | The caller's `Mastery`: the four moves in session order, at level 1 until the orchestrator raises them |
 | `GET /me/memory` | The caller's `MemoryView` (CONTRACTS.md section 2b), what the app's Memory sheet shows: per concept and part the level now and how it changed, and the latest guess against the score beside the one before. `{ "concepts": [] }` with memory off, or before a first finished session |
-| `DELETE /me/data` | `204`. Purges the caller's memory scope, then deletes their sessions, their agent logs and mastery (the delete button). If the purge fails, nothing is deleted and the answer is a `500`, so the learner can try again |
+| `DELETE /me/data` | `204`. Resolves tracked memory writes before purging the caller's scope, then deletes their sessions, agent logs and mastery. Scope registration and fact writes retry transient failures; fact writes carry a stable `Idempotency-Key`. After an ambiguous result, later errors do not release the deletion fence until the same request is confirmed. If deletion is still pending after 30 s, the API returns `502`; retries continue until the provider's 24-hour key-retention window, after which unresolved work stays fenced without another provider request. A process restart or another API process is outside this in-memory fence, and Agent Memory docs do not promise forget/write ordering. Other internal failures return `500`. |
 
 The session and `/me` routes need the Clerk session token as `Authorization: Bearer <token>` (#23).
 The API checks it without a network call, using the instance's PEM public key in `CLERK_JWT_KEY` (in
@@ -69,13 +69,20 @@ and the last healthy deploy stays up.
 
 ## Claude calls
 
-[`src/call-agent.ts`](src/call-agent.ts) is the only code that talks to Claude (#10). Each agent is
-one structured-output call, set up from Cynthia's registry in `@build-north/agents` (`AGENTS`, #2):
-the agent's system prompt, the user message its `render` writes from the input, its effort, and its
-Zod schemas. The reply is checked against the output schema. Every call writes an `agent_log` row
-with its milliseconds and its cost in dollars. An agent that isn't in the registry fails before any
-call. When the coach's call fails (#44), the session still ends: `advance` writes fixed text from the
-result's numbers instead.
+[`src/call-agent.ts`](src/call-agent.ts) is the only code that talks to Claude (#10). Each agent call
+uses the structured-output setup from Cynthia's registry in `@build-north/agents` (`AGENTS`, #2):
+the system prompt, rendered user message, effort, and Zod schemas. The API counts input tokens before
+sending and checks the reply against the output schema. It retries one transient Messages failure
+automatically; the SDK's hidden retries are disabled so each outbound attempt can be accounted for.
+Each attempt first creates one `agent_log` row with `outcome: "started"`, `costStatus: "reserved"` and
+the conservative maximum reservation. Claude is not called if that insert fails. Once usage or a provider
+error is known, the same row is finalized; if the process exits or the update fails first, the row remains
+started with its reserved amount. A retry uses the same `callId` and the next attempt number. `usd` is measured
+usage after successful finalization, a conservative maximum reservation when usage is unknown, or zero for a
+provider error response when that update succeeds. The input token-count endpoint is free but has its own
+request limit. An agent that isn't in
+the registry fails before a provider call. When the coach's call fails (#44), the session still ends:
+`advance` writes fixed text from the result's numbers instead.
 
 | Variable | What it does |
 |---|---|
@@ -84,21 +91,31 @@ result's numbers instead.
 | `AGENT_BUDGET_USD` | Required with the key: the Claude budget in dollars |
 | `REQUESTS_PER_MINUTE` | Per IP, every route except `/health`; 60 when unset. Raise it for a room of testers on one Wi-Fi, who share an IP (240 on Render since Oct 23) |
 
-Following DECISIONS.md (Oct 20), calls stop at 95% of the budget, and while any of Anthropic's
-rate-limit windows is 95% used, until it refills. Both come back as a `rate_limited` error in the
-`Turn`: retryable for a rate limit, not for the budget. The spend is counted in memory, so it starts
-again at $0 after a restart; the account's own balance, with auto-reload off (#20), is the hard stop.
+Following DECISIONS.md (Oct 20), new Messages attempts reserve enough of the remaining budget for
+their token-count estimate for input and configured output ceiling before they are sent, and stop at
+95% of the budget. The reservation prevents concurrent calls in this process from admitting more
+estimated cost than remains. If returned usage exceeds the estimate, the measured usage still counts
+and later calls stop at the budget threshold. Calls also stop while any of Anthropic's reported
+rate-limit windows is 95% used. A transient
+failure gets one automatic retry when its reservation fits; a remaining rate limit is retryable, but
+a budget limit is not. Spend and unknown-cost reservations are in memory for this process only: they
+reset on restart, and each API replica keeps a separate counter. The Anthropic account balance and
+configured spend limit remain the external hard stop (#20).
 
 ## SurrealDB
 
 - SurrealDB 3 does not create a namespace or database on first use. `SURREAL_NAMESPACE` and
   `SURREAL_DATABASE` must already exist on the instance (create them in Surrealist); otherwise
-  `/health/db` answers `503` and the log says `The namespace '…' does not exist`.
+  startup fails before listening and the log identifies the missing namespace or database.
 - `SURREAL_AUTH_LEVEL` is the level the user was created at: `root` (default), `namespace` or `database`.
 - Two databases on the instance: `dev` for local work, and `prod`, which only Render uses, so the
   testers' sessions never mix with test data.
-- One connection per process, opened at startup. After a drop it reconnects on its own; requests in
-  the meantime fail after 5 s instead of hanging.
+- Startup awaits authentication (5 s deadline) and schema initialization before listening. Either failure
+  closes the client and exits. After a successful start a dropped connection reconnects; queries fail after 5 s.
+- Remote database endpoints require `https:` or `wss:`; Agent Memory requires `https:`. Plaintext is allowed
+  only for localhost, 127.0.0.1, or ::1 in development, never in production or on Render. URL credentials and
+  fragments are rejected. Partially configured Memory purge credentials fail startup instead of silently skipping deletion.
+- Production and Render require `CLERK_JWT_KEY`; neither accepts development authentication headers.
 - All the database code is in [`src/store.ts`](src/store.ts), and the orchestrator never touches the
   database. At startup the store defines the `session`, `mastery` and `agent_log` tables from
   CONTRACTS.md section 4. They stay schemaless so the orchestrator's state can grow, but the fields
@@ -108,7 +125,10 @@ again at $0 after a restart; the account's own balance, with auto-reload off (#2
 
 [`src/memory.ts`](src/memory.ts) is the API's side of SurrealDB Agent Memory (CONTRACTS.md section 2,
 Memory): what earlier sessions left about a learner, read before the hint giver and the coach, written
-when a session reaches its result, shown by `GET /me/memory` and purged by `DELETE /me/data`. Off by
+when a session reaches its result, shown by `GET /me/memory` and purged by `DELETE /me/data`. Ambiguous fact writes retry
+with their original idempotency key/body until confirmed. If deletion waits more than 30 s, it returns `502` but keeps
+the in-process fence; retries stop before the provider's 24-hour key-retention window, and unresolved work stays fenced.
+Writes and later deletes wait behind it. This does not coordinate another API process or survive a process restart. Off by
 default in the code; on in production since Oct 23 at 9:11 PM ET (`DECISIONS.md`, "Agent Memory goes on for
 the testers"): `/health` answers `"memory": "on"`, and the kill switch is `AGENT_MEMORY_ENABLED` set to anything
 else (about a minute, no deploy).
@@ -209,7 +229,8 @@ Seven checks with no credentials, exit code 1 on any failure: `/health`, `/healt
 database for its clock), a call with no token and one with the dev headers both answer 401, the web build's origin
 passes the CORS preflight, the web build answers with Lumente's title, and its bundle names this API's
 host (a demo-mode export would not). A full session on the public URL is still a person's walk through
-the web build; this is the part before and after it, and the warm-up before the testers.
+the web build; this is the part before and after it, and the warm-up before the testers. Every request has a
+10 s deadline that remains active through body reading. Probe failures do not prevent subsequent checks.
 
 ## Deploy on Render
 

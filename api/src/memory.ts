@@ -20,6 +20,7 @@ import {
 } from "@build-north/agents";
 import { createHash } from "node:crypto";
 import { pseudonymOf } from "./export-testers.ts";
+import { validateServiceUrl } from "./service-url.ts";
 
 // SurrealDB Agent Memory on Leo's side (#112, CONTRACTS.md section 2, Memory): what the API writes after a
 // session, what it reads before the hint giver and the coach, the Memory sheet's view, and the purge behind
@@ -34,9 +35,12 @@ export type MemoryConfig = { endpoint: string; context: string; apiKey: string; 
 export const MEMORY_READ_MS = 1_500;
 /** Writes and the purge run off the request path, so they can take longer. */
 const WRITE_MS = 10_000;
-/** A history page, and how many a read walks before it stops: nine rows a session, so plenty. */
+const WRITE_RETRY_BASE_MS = 100;
+const WRITE_RETRY_MAX_MS = 30_000;
+// Agent Memory documents a 24-hour idempotency cache; stop earlier if a fact write stays ambiguous.
+const WRITE_IDEMPOTENCY_WINDOW_MS = 23 * 60 * 60 * 1_000;
+/** Provider page size; the caller's deadline bounds the complete traversal. */
 const PAGE = 200;
-const MAX_PAGES = 5;
 
 const ON = /^(1|true|on|yes)$/i;
 
@@ -50,18 +54,18 @@ export function memoryConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Memor
   if (!endpoint || !context || !apiKey) {
     throw new Error("AGENT_MEMORY_ENABLED is on, so AGENT_MEMORY_ENDPOINT, AGENT_MEMORY_CONTEXT and AGENT_MEMORY_API_KEY are required");
   }
-  if (!URL.canParse(endpoint)) throw new Error("AGENT_MEMORY_ENDPOINT is not a URL (expected https://<the context's host>)");
+  validateServiceUrl(endpoint, "AGENT_MEMORY_ENDPOINT", env);
   return { endpoint: endpoint.replace(/\/+$/, ""), context, apiKey, salt: env.LEARNER_ID_SALT ?? "" };
 }
 
 // With the flag off, Delete my data still needs memory when it is set up: what a learner left there while the flag was
-// on is still theirs to delete (code review, Oct 28). Null when memory was never set up, or its endpoint isn't a URL.
+// on is still theirs to delete. Partial configuration must fail startup, never silently disable deletion.
 export function memoryPurgeConfigFromEnv(env: NodeJS.ProcessEnv = process.env): MemoryConfig | null {
   const endpoint = env.AGENT_MEMORY_ENDPOINT?.trim();
   const context = env.AGENT_MEMORY_CONTEXT?.trim();
   const apiKey = env.AGENT_MEMORY_API_KEY?.trim();
-  if (!endpoint || !context || !apiKey || !URL.canParse(endpoint)) return null;
-  return { endpoint: endpoint.replace(/\/+$/, ""), context, apiKey, salt: env.LEARNER_ID_SALT ?? "" };
+  if (!endpoint && !context && !apiKey) return null;
+  return memoryConfigFromEnv({ ...env, AGENT_MEMORY_ENABLED: "true" });
 }
 
 // ---------- Names: the scope, the entity and the keys ----------
@@ -201,7 +205,7 @@ export type MemoryApi = {
   /** Registers the scope path; one that exists already is fine. */
   registerScope(path: string, signal: AbortSignal): Promise<void>;
   /** Writes the triples into the scope, every row stamped with the labels. */
-  write(scope: string, labels: readonly string[], triples: readonly Triple[], signal: AbortSignal): Promise<void>;
+  write(scope: string, labels: readonly string[], triples: readonly Triple[], signal: AbortSignal, idempotencyKey: string): Promise<void>;
   /** Every attribute row of the entity, every key, superseded ones included; [] for an entity memory doesn't have. */
   history(entity: MemoryEntity, signal: AbortSignal): Promise<MemoryRow[]>;
   /** Hard-deletes everything under the scope path; how many rows went (0 for a scope that was never registered). */
@@ -218,9 +222,10 @@ export function createMemoryApi({ endpoint, context, apiKey }: Omit<MemoryConfig
   const base = `${endpoint}/api/v1/${encodeURIComponent(context)}`;
 
   // The error body is { message }; a status in `accepted` comes back instead of throwing.
-  async function call<T>(method: "GET" | "POST", path: string, body: unknown, signal: AbortSignal, accepted: readonly number[] = []): Promise<{ status: number; json: T | null }> {
+  async function call<T>(method: "GET" | "POST", path: string, body: unknown, signal: AbortSignal, accepted: readonly number[] = [], idempotencyKey?: string): Promise<{ status: number; json: T | null }> {
     const headers: Record<string, string> = { authorization: `Bearer ${apiKey}` };
     if (body !== undefined) headers["content-type"] = "application/json";
+    if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
     const res = await send(`${base}${path}`, { method, headers, ...(body !== undefined ? { body: JSON.stringify(body) } : {}), signal });
     const json = (await res.json().catch(() => null)) as T | null;
     if (!res.ok && !accepted.includes(res.status)) {
@@ -240,14 +245,16 @@ export function createMemoryApi({ endpoint, context, apiKey }: Omit<MemoryConfig
       }
     },
 
-    async write(scope, labels, triples, signal) {
-      await call("POST", "/facts", { infer: "triples", scopes: [[scope]], memory_category: "knowledge", labels, triples }, signal);
+    async write(scope, labels, triples, signal, idempotencyKey) {
+      await call("POST", "/facts", { infer: "triples", scopes: [[scope]], memory_category: "knowledge", labels, triples }, signal, [], idempotencyKey);
     },
 
     async history(entity, signal) {
       const rows: MemoryRow[] = [];
       let cursor: string | null = null;
-      for (let page = 0; page < MAX_PAGES; page++) {
+      const seen = new Set<string>();
+      while (true) {
+        signal.throwIfAborted();
         const query: string = `?limit=${PAGE}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
         const { status, json }: { status: number; json: { history?: MemoryRow[]; page?: { nextCursor?: string | null } } | null } = await call(
           "GET",
@@ -256,10 +263,14 @@ export function createMemoryApi({ endpoint, context, apiKey }: Omit<MemoryConfig
           signal,
           [404],
         );
-        if (status === 404 || !json?.history) return rows;
+        if (status === 404 && cursor === null) return rows;
+        if (status === 404 || !Array.isArray(json?.history)) throw new MemoryError(502, "Memory history page is missing or malformed");
         rows.push(...json.history);
         cursor = json.page?.nextCursor ?? null;
-        if (!cursor) break;
+        if (cursor === null) break;
+        if (typeof cursor !== "string" || seen.has(cursor)) throw new MemoryError(502, "Memory history returned an invalid or repeated cursor");
+        if (!cursor) throw new MemoryError(502, "Memory history returned an empty cursor");
+        seen.add(cursor);
       }
       return rows;
     },
@@ -393,8 +404,8 @@ export type LearnerMemoryStore = {
    * doesn't answer within MEMORY_READ_MS: the agent then runs without memory. Never throws. */
   recall(user: string, concept: string, sessionId: string): Promise<LearnerMemory | undefined>;
   /** Writes the facts a session with a result leaves (factsToWrite), after one read of what memory already holds
-   * so parts with no level row yet get their baseline. Throws when a write failed. Once `stop` aborts (Delete my
-   * data began), it writes nothing more: the write in flight finishes, so the purge after it removes that one too. */
+   * so parts with no level row yet get their baseline. Ambiguous writes retry with the same idempotency key until
+   * memory confirms them, so Delete my data waits for any in-flight commit before purging. */
   remember(user: string, session: Session, stop?: AbortSignal): Promise<void>;
   /** The Memory sheet: the concepts given, in that order, leaving out the ones memory holds nothing on. */
   view(user: string, concepts: readonly string[], reads: readonly (readonly string[])[]): Promise<MemoryView>;
@@ -409,12 +420,50 @@ export type LearnerMemoryOptions = Pick<MemoryConfig, "salt"> & {
   readMs?: number;
   /** How long a write, the sheet's reads and the purge wait for memory (WRITE_MS). */
   writeMs?: number;
+  /** Test seam for the provider's idempotency retention window. Defaults to 23 hours. */
+  writeIdempotencyWindowMs?: number;
   warn?: (message: string) => void;
 };
 
-/** The reason AbortSignal.timeout gives: memory stopped answering in time, and may still apply what it was sent. */
-const timedOut = (error: unknown) => (error as { name?: unknown } | null)?.name === "TimeoutError";
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function retryableMemoryError(error: unknown): boolean {
+  if (error instanceof MemoryError) return error.status === 408 || error.status === 409 || error.status === 425 || error.status === 429 || error.status >= 500;
+  return error instanceof TypeError || (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError"));
+}
+
+function mayHaveCommitted(error: unknown): boolean {
+  if (error instanceof MemoryError) return error.status === 408 || error.status === 409 || error.status >= 500;
+  return error instanceof TypeError || (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError"));
+}
+
+async function retryUntilConfirmed<T>(work: () => Promise<T>, idempotencyWindowMs?: number): Promise<T> {
+  let attempt = 0;
+  let uncertainAt: number | undefined;
+  for (;;) {
+    if (uncertainAt !== undefined && idempotencyWindowMs !== undefined && performance.now() - uncertainAt >= idempotencyWindowMs) {
+      console.error("Agent Memory operation remained ambiguous past its idempotency window; keeping learner writes fenced without another retry");
+      await new Promise<never>(() => {});
+    }
+    try {
+      return await work();
+    } catch (error) {
+      if (uncertainAt === undefined && mayHaveCommitted(error)) uncertainAt = performance.now();
+      // After an ambiguous response, later 4xx errors cannot prove the earlier operation did not commit.
+      if (uncertainAt === undefined && !retryableMemoryError(error)) throw error;
+      const backoff = Math.min(WRITE_RETRY_BASE_MS * 2 ** attempt++, WRITE_RETRY_MAX_MS);
+      const jittered = Math.round(backoff * (0.75 + Math.random() * 0.5));
+      const delay = Math.min(jittered, WRITE_RETRY_MAX_MS);
+      await sleep(delay);
+    }
+  }
+}
+
+function writeKey(scope: string, labels: readonly string[], triple: Triple): string {
+  return createHash("sha256")
+    .update(JSON.stringify({ infer: "triples", scopes: [[scope]], memory_category: "knowledge", labels, triples: [triple] }))
+    .digest("hex");
+}
 
 /** `work`, unless `signal` aborts first: then its reason. The read before an agent gives up at its budget, whatever it
  * is waiting on (memory, or the database's answer about the sessions). */
@@ -437,10 +486,12 @@ export const memoryPurgeOf =
 
 export function createLearnerMemory(
   api: MemoryApi,
-  { salt, conceptsOf, readMs = MEMORY_READ_MS, writeMs = WRITE_MS, warn = (message) => console.warn(message) }: LearnerMemoryOptions,
+  { salt, conceptsOf, readMs = MEMORY_READ_MS, writeMs = WRITE_MS, writeIdempotencyWindowMs = WRITE_IDEMPOTENCY_WINDOW_MS, warn = (message) => console.warn(message) }: LearnerMemoryOptions,
 ): LearnerMemoryStore {
   // scopes registered by this process, so a learner's second session doesn't ask again
   const registered = new Set<string>();
+  // Separate finished sessions can target the same entity. Keep each learner's write sequence intact.
+  const writesByLearner = new Map<string, Promise<void>>();
   const who = (user: string) => pseudonymOf(user, salt);
   const forget = memoryPurgeOf(api, { salt, writeMs });
   const reason = (error: unknown) => (error instanceof Error ? error.message : String(error));
@@ -450,9 +501,11 @@ export function createLearnerMemory(
   // entity name: C++'s rows from before then sit under the name C still reads, and they stay out of C and still reach
   // C++ (code review, Oct 28). A row from a session the learner doesn't have counts for nothing.
   async function rowsOf(user: string, concept: string, signal: AbortSignal): Promise<MemoryRow[]> {
+    signal.throwIfAborted();
     const pseudonym = who(user);
     const names = [...new Set([entityOf(pseudonym, concept).name, legacyEntityOf(pseudonym, concept).name])];
     const rows = (await Promise.all(names.map((name) => api.history({ type: "topic", name }, signal)))).flat();
+    signal.throwIfAborted();
     const ids = [...new Set(rows.flatMap((row) => labelOf(row, "session") ?? []))];
     if (ids.length === 0) return [];
     const concepts = await conceptsOf(user, ids);
@@ -461,6 +514,49 @@ export function createLearnerMemory(
       const written = concepts.get(labelOf(row, "session") ?? "");
       return written !== undefined && conceptKey(written) === key;
     });
+  }
+
+  async function rememberOne(user: string, session: Session, stop?: AbortSignal): Promise<void> {
+    if (!session.result || stop?.aborted) return;
+    const at = new Date().toISOString();
+    const pseudonym = who(user);
+    const scope = scopeOf(pseudonym);
+    const entity = entityOf(pseudonym, session.concept);
+    // What memory holds already decides which parts need a baseline level row. Off the request path, so the
+    // read gets the write budget; when it fails, the session's level changes are still written.
+    let onRecord: ReadonlySet<MoveId> | undefined;
+    try {
+      onRecord = levelsOnRecord(await rowsOf(user, session.concept, AbortSignal.timeout(writeMs)));
+    } catch (error) {
+      warn(`memory history skipped before the write, so only level changes are written: ${reason(error)}`);
+    }
+    const writes = factsToWrite(session, at, onRecord);
+    if (stop?.aborted) return;
+    if (!registered.has(scope)) {
+      await retryUntilConfirmed(() => api.registerScope(scope, AbortSignal.timeout(writeMs)));
+      registered.add(scope);
+    }
+    // One write per fact, so each row carries its own numbers in its labels, and one after another: the live
+    // context answered "unknown error" to parallel writes on the same entity (Oct 23), one transaction each.
+    for (const write of writes) {
+      // A delete stops later facts, but this fact must be confirmed before its scope can be purged.
+      if (stop?.aborted) break;
+      const labels = labelsOf({ session: session.id, turn: session.turn, ...write.labels });
+      const triple = { entity, key: write.key, value: write.value, occurred_at: at };
+      const key = writeKey(scope, labels, triple);
+      await retryUntilConfirmed(() => api.write(scope, labels, [triple], AbortSignal.timeout(writeMs), key), writeIdempotencyWindowMs);
+    }
+  }
+
+  async function remember(user: string, session: Session, stop?: AbortSignal): Promise<void> {
+    const previous = writesByLearner.get(user) ?? Promise.resolve();
+    const current = previous.catch(() => {}).then(() => rememberOne(user, session, stop));
+    writesByLearner.set(user, current);
+    try {
+      await current;
+    } finally {
+      if (writesByLearner.get(user) === current) writesByLearner.delete(user);
+    }
   }
 
   return {
@@ -477,57 +573,20 @@ export function createLearnerMemory(
       }
     },
 
-    async remember(user, session, stop) {
-      if (!session.result || stop?.aborted) return;
-      const at = new Date().toISOString();
-      const pseudonym = who(user);
-      const scope = scopeOf(pseudonym);
-      const entity = entityOf(pseudonym, session.concept);
-      // What memory holds already decides which parts need a baseline level row. Off the request path, so the
-      // read gets the write budget; when it fails, the session's level changes are still written.
-      let onRecord: ReadonlySet<MoveId> | undefined;
-      try {
-        onRecord = levelsOnRecord(await rowsOf(user, session.concept, AbortSignal.timeout(writeMs)));
-      } catch (error) {
-        warn(`memory history skipped before the write, so only level changes are written: ${reason(error)}`);
-      }
-      const writes = factsToWrite(session, at, onRecord);
-      if (stop?.aborted) return;
-      if (!registered.has(scope)) {
-        await api.registerScope(scope, AbortSignal.timeout(writeMs));
-        registered.add(scope);
-      }
-      // One write per fact, so each row carries its own numbers in its labels, and one after another: the live
-      // context answered "unknown error" to parallel writes on the same entity (Oct 23), one transaction each.
-      const failures: unknown[] = [];
-      let late = false;
-      for (const write of writes) {
-        // never aborts the write in flight: memory may still apply one it stopped waiting for, after the purge
-        if (stop?.aborted) break;
-        try {
-          await api.write(scope, labelsOf({ session: session.id, turn: session.turn, ...write.labels }), [{ entity, key: write.key, value: write.value, occurred_at: at }], AbortSignal.timeout(writeMs));
-        } catch (error) {
-          failures.push(error);
-          if (timedOut(error)) late = true;
-        }
-      }
-      // A write memory stopped answering in time may still be applied. Waiting one more write's time before returning
-      // keeps a delete that waits for this (learnerWrites) from purging before memory applies it (code review, Oct 28).
-      if (late) await sleep(writeMs);
-      if (stop?.aborted) return;
-      if (failures.length > 0) throw new Error(`${failures.length} of ${writes.length} memory writes failed: ${reason(failures[0])}`);
-    },
+    remember,
 
     async view(user, concepts, reads) {
+      const deadline = AbortSignal.timeout(writeMs);
       const readBy = readCountsOf(reads);
       const out: MemoryView["concepts"] = [];
       // one card per history: "CORS" and "cors" are the same entity, so the first spelling (the newest) shows it once
       const shown = new Set<string>();
       for (const concept of concepts) {
+        deadline.throwIfAborted();
         const key = conceptKey(concept);
         if (shown.has(key)) continue;
         shown.add(key);
-        const rows = await rowsOf(user, concept, AbortSignal.timeout(writeMs));
+        const rows = await within(rowsOf(user, concept, deadline), deadline);
         if (rows.length > 0) out.push(viewOf(concept, rows, readBy));
       }
       return MemoryViewSchema.parse({ concepts: out });

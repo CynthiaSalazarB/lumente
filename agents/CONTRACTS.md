@@ -66,14 +66,14 @@ rejects both when `NODE_ENV=production` or when no `DEV_KEY` is set. Every route
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| `POST` | `/sessions` | `{ concept, material?, mode? }` | `Turn` (asks for the prediction) |
-| `POST` | `/sessions/:id/turns` | one of `{ prediction }`, `{ text }`, `{ question }`, `{ mentefacto }`, `{ action: "help" }`, `{ action: "continue" }` | `Turn` |
+| `POST` | `/sessions` | `{ concept, material?, mode? }`; optional `Idempotency-Key` header | `201` with the first `Turn` (asks for the prediction). Same learner, key and normalized body replay that first Turn while the session exists, including across API restarts. Reusing the key with different input returns `409` with `{ error }`. Keys contain 1–128 letters, digits, underscores or hyphens; invalid keys return `400`. Without a key, each request creates a session. |
+| `POST` | `/sessions/:id/turns` | one of `{ prediction }`, `{ text }`, `{ question }`, `{ mentefacto }`, `{ action: "help" }`, `{ action: "continue" }` | `Turn`; duplicate requests wait up to 25 s for the active handler, then return the saved latest `Turn`, a retryable latest `Turn`, or `503` while work remains active |
 | `GET` | `/sessions` | | `{ sessions: SessionSummary[] }`: the caller's sessions that have a Turn, newest first (`id`, `concept`, `mode`, `createdAt`, `finished`, and `score` and `predictedScore` once the result is in; the schema is in `agents/src/contracts.ts`). Start lists the unfinished ones to pick up and the finished ones under "Your maps", each opened through `GET /sessions/:id` |
 | `GET` | `/sessions/:id` | | latest `Turn`: Resume on Start reads it after a reload or a killed app (#137). `404` for a session that isn't the caller's |
-| `GET` | `/sessions/:id/transcript` | | `{ steps: TranscriptStep[] }`: every saved step, oldest first, each the body the learner sent (`null` for the start) and the `Turn` it got. The app replays them so a session picked up again, or a map opened again, shows its whole conversation. Empty for a session saved before Oct 25 (the app then shows the latest `Turn` alone). `404` for a session that isn't the caller's |
+| `GET` | `/sessions/:id/transcript` | | `{ steps: TranscriptStep[], material?: string \| null }`: every saved step, oldest first, each the body the learner sent (`null` for the start) and the `Turn` it got. The app replays them so a session picked up again, or a map opened again, shows its whole conversation. `?material=1` also includes the session's original notes for recovery. Empty for a session saved before Oct 25 (the app then shows the latest `Turn` alone). `404` for a session that isn't the caller's |
 | `GET` | `/me/mastery` | | `Mastery` |
 | `GET` | `/me/memory` | | `MemoryView` (the Memory sheet; see [Memory](#memory-what-earlier-sessions-left)) |
-| `DELETE` | `/me/data` | | `204`, deletes sessions, logs (by their session or their learner) and mastery, and purges the learner's memory, with the memory flag off too when memory is set up (the delete button); `502` when memory refuses the purge, and nothing is deleted |
+| `DELETE` | `/me/data` | | `204`, deletes sessions, logs (by their session or their learner) and mastery, and purges the learner's memory, with the memory flag off too when memory is set up (the delete button); `502` if memory refuses or a tracked write does not settle within 30 s |
 | `GET` | `/health` | | `{ ok: true, commit, memory }`: the running commit (7 characters, `null` locally) and `"on"` or `"off"` for Agent Memory (#143). Never touches the database, and the rate limit skips it |
 | `GET` | `/health/db` | | `{ ok: true, ... }` with SurrealDB's clock and the milliseconds it took (read-only); `503` when the database is not configured or does not answer. An ops check, not part of the app contract |
 
@@ -81,6 +81,14 @@ One endpoint moves a session forward: `/turns`. The app sends the body the last 
 asks for: `prediction` → `{ prediction }`, `text` → `{ text }`, `continue` → `{ action: "continue" }`,
 `map` → `{ question }` while the learner asks and `{ mentefacto }` to submit. `{ action: "help" }`
 works during the moves, the whole map included.
+
+The app persists a start key before sending `POST /sessions`, scoped to the API address, authentication
+kind, learner and normalized request body. It retains that key while the session is unfinished, including
+after a successful response: another tab can still need it after a lost response. It reads the latest Turn
+after replay and restores the transcript if the session advanced. Once the session reaches its result, a
+new start replaces the key. Device storage failure prevents sending an unprotected start; successful
+data deletion also clears this learner/API scope's keys. Stored entries contain hashes and random keys,
+not the learner's notes. Browser reservations use Web Locks; unsupported locking fails explicitly.
 
 `text` allows up to 2,000 characters; `question` allows up to 500. Saved transcripts keep older, longer answers and questions readable. The limits stop only a body the Turn would judge: a resend of a Turn already judged still gets the latest Turn, and a missing session its 404. An answer refused for its length goes back to the app's answer field, out of the conversation, to shorten and send again.
 
@@ -92,7 +100,10 @@ and a `summary` message) and `expects: "none"`.
 Every `/turns` body also carries `turn`: the number of the `Turn` it answers. If that number is
 older than the session's latest, the API returns the latest `Turn` as it is and doesn't call
 `advance` again, so an answer resent after a timeout is judged once. The app disables Send while a
-call is pending.
+call is pending. Across API instances, an expiring database claim admits one handler per session/Turn and renews
+every 20 seconds. A replaced claim fences the old handler's save. Claims expire after two minutes without renewal;
+after a process crash, the client must retry to reclaim the Turn. A long database outage or process pause can allow
+duplicate provider work after expiry, but the stale owner cannot save over the current Turn.
 
 A body the latest `Turn` doesn't ask for gets `409` with the latest `Turn`, and `advance` isn't
 called: a `turn` newer than the latest, a body other than the one `expects` names, Help before the
@@ -225,8 +236,12 @@ it needs) instead of asking a plain fact. In session 1 both are 0: the app does 
 
 Every prompt, and every line the app shows, is in English in this version.
 
-Each agent is one `client.messages.create()` call with `output_config.format: zodOutputFormat(schema)`,
-and the API checks the reply against the same schema, so the output is valid JSON or the call fails.
+Each logical agent invocation sends a `client.messages.create()` request with `output_config.format: zodOutputFormat(schema)`,
+and the API checks the reply against the same schema, so the output is valid JSON or the call fails. The SDK's
+automatic retries are disabled; the API may retry one transient Messages failure when the second attempt's budget
+reservation fits. Before each outbound attempt, the API creates a reserved `agent_log` row with `outcome: "started"`;
+after usage or an error is known, it finalizes that same row. If the process exits or the update fails, the row keeps
+its conservative reservation rather than claiming a measured charge.
 The system prompt and the user message come from the agent's entry in `AGENTS` (`agents/src/agents.ts`):
 `system`, and `render` writing the user message from the input (below). The API never shows the
 learner anything an agent didn't return.
@@ -526,20 +541,17 @@ with `error` set. What `callAgent` throws carries `code` and `retryable`, the tw
 | Table | Fields | Notes |
 |---|---|---|
 | `mastery` | user, move, level, unassistedSuccesses, updatedAt | one row per user per move; read every turn |
-| `session` | id, user, concept, material, mode, turn, lastTurn, predictedScore, firstAttempt, phase, move, hintStep, hintsPerMove, mentefacto, recent, retries, lastIssue, nextQuestion, questions, moveLog, result, transcript, createdAt | the orchestrator's state; `lastTurn` is returned again on a repeat; `hintsPerMove` starts with all four moves at 0, `retries` at 0, `lastIssue` at `"none"`, `nextQuestion` at null. `transcript` is the API's, not the orchestrator's: one `{ body, turn }` per saved Turn, appended in the same conditional write as the Turn, never for an error Turn, a resend or a 409; `[]` on sessions saved before Oct 25 |
-| `agent_log` | session, user?, agent, input, output, ms, usd, at, dropped? | append-only; debugging, the testers' numbers (fact desk rows are the questions metric) and what a session costs. `user` (since Oct 28) names the learner the call was for, so Delete my data finds a row whose session is gone; older rows go by their session. `dropped` is on a coach or hint giver row whose output cited a fact id the API hadn't passed in (CONTRACTS.md, Memory) |
+| `session` | id, user, concept, material, mode, turn, lastTurn, predictedScore, firstAttempt, phase, move, hintStep, hintsPerMove, mentefacto, recent, retries, lastIssue, nextQuestion, questions, moveLog, result, transcript, createdAt | the orchestrator's state; `lastTurn` is returned again on a repeat; `hintsPerMove` starts with all four moves at 0, `retries` at 0, `lastIssue` at `"none"`, `nextQuestion` at null. `transcript` is the API's, not the orchestrator's: one `{ body, turn }` per saved Turn, appended in the same conditional write as the Turn, never for an error Turn, a resend or a 409; `[]` on sessions saved before Oct 25. The API also keeps temporary `activeTurnClaim` and `activeTurnClaimUntil` fields on the row to lease one handler per session/turn across API instances; they are not part of `Session` and never reach the learner |
+| `agent_log` | session, user?, agent, input, output, ms, usd, callId, attempt, outcome, costStatus, status?, at, dropped? | one row per provider attempt; inserted as `outcome: "started"` with a reserved upper bound before send, then finalized after usage or error is known. A process exit or failed update leaves the row started/reserved. Rows support debugging, tester metrics and budget accounting; in-flight rows are excluded from Memory read counts. Retries for one call share `callId` and have increasing `attempt`. `usd` is measured usage after finalization, a reserved upper bound when cost is unknown, or zero for a provider error response when finalized; `costStatus` names which. `user` (since Oct 28) names the learner the call was for, so Delete my data finds a row whose session is gone; older rows go by their session. `dropped` is on a coach or hint giver row whose output cited a fact id the API hadn't passed in (CONTRACTS.md, Memory) |
 
 With the memory flag on, SurrealDB Agent Memory keeps one scope per learner (a salted hash of the Clerk
 id) holding the facts in [Memory](#memory-what-earlier-sessions-left): each with its source, the agent that
 wrote it, the fact it superseded and who read it. It's a copy for the agents and the Memory sheet; the
 tables above stay the record.
 
-`DELETE /me/data` purges the user's memory scope first (`POST /scopes/forget`, a hard delete), then removes all three tables' rows
-(`agent_log` by `session.user` or `user`).
-Both wait for the user's writes in flight in the API process (a Turn being answered, with its `agent_log` rows; the
-memory write a result started, which stops before its next fact, and after a write memory stopped answering in time
-waits one more write's time, since memory may still apply it), and the user's writes that arrive meanwhile wait for
-the delete, so nothing comes back after the 204.
+`DELETE /me/data` resolves the user's tracked memory writes before purging the scope (`POST /scopes/forget`, a hard delete), then removes all three tables' rows (`agent_log` by `session.user` or `user`). Scope registration and fact writes retry transient failures. Each fact write uses an idempotency key derived from its exact request body; after an ambiguous result, later errors do not release the deletion fence until the same request is confirmed. Retries stop before the provider's 24-hour key-retention window; unresolved work keeps the fence pending without another provider request. New writes for that learner wait behind the deletion.
+
+After 30 seconds the route returns `502`, but its in-process deletion fence remains active. A retry can observe completion if the write settles. The fence is process-local: it does not survive a restart or coordinate multiple API processes. Agent Memory documents idempotent fact writes but does not document ordering between an outstanding write and scope forget, so those cases remain outside this guarantee.
 
 ---
 

@@ -7,6 +7,10 @@
     "agents"
   ],
   "scripts": {
-    "test": "npm test --workspaces --if-present"
+    "test": "npm test --workspaces --if-present",
+    "test:browser-recovery": "node scripts/session-recovery-browser.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.61.1"
   }
 }

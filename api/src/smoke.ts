@@ -8,6 +8,9 @@ const WEB = process.argv[3]?.replace(/\/+$/, "") || "https://lumente.expo.app";
 
 type Check = { name: string; ok: boolean; detail: string };
 
+// The signal stays attached while the body is read, not just until response headers arrive.
+const request = (url: string, init?: RequestInit) => fetch(url, { ...init, signal: AbortSignal.timeout(10_000) });
+
 const timed = async (run: () => Promise<Response>): Promise<{ res: Response; ms: number }> => {
   const started = performance.now();
   const res = await run();
@@ -24,42 +27,42 @@ async function check(name: string, run: () => Promise<{ ok: boolean; detail: str
 
 const checks: Check[] = [
   await check("API /health", async () => {
-    const { res, ms } = await timed(() => fetch(`${API}/health`));
+    const { res, ms } = await timed(() => request(`${API}/health`));
     const body = (await res.json().catch(() => null)) as { ok?: boolean; commit?: string | null; memory?: string } | null;
     return { ok: res.status === 200 && body?.ok === true, detail: `${res.status} in ${ms} ms, commit ${body?.commit ?? "unknown"}, memory ${body?.memory ?? "unknown"}` };
   }),
-  await check("API /health/db writes to the database", async () => {
-    const { res, ms } = await timed(() => fetch(`${API}/health/db`));
+  await check("API /health/db reads from the database", async () => {
+    const { res, ms } = await timed(() => request(`${API}/health/db`));
     const body = (await res.json().catch(() => null)) as { ok?: boolean; ms?: number } | null;
     return { ok: res.status === 200 && body?.ok === true, detail: `${res.status} in ${ms} ms, database ${body?.ms ?? "?"} ms` };
   }),
   await check("API refuses a call with no token", async () => {
-    const { res } = await timed(() => fetch(`${API}/me/mastery`));
+    const { res } = await timed(() => request(`${API}/me/mastery`));
     return { ok: res.status === 401, detail: `${res.status}` };
   }),
   await check("API refuses the dev headers", async () => {
-    const { res } = await timed(() => fetch(`${API}/me/mastery`, { headers: { "x-dev-user": "smoke", "x-dev-key": "smoke" } }));
+    const { res } = await timed(() => request(`${API}/me/mastery`, { headers: { "x-dev-user": "smoke", "x-dev-key": "smoke" } }));
     return { ok: res.status === 401, detail: `${res.status}` };
   }),
   await check("API allows the web build's origin (CORS preflight)", async () => {
     const { res } = await timed(() =>
-      fetch(`${API}/sessions`, { method: "OPTIONS", headers: { origin: WEB, "access-control-request-method": "POST", "access-control-request-headers": "authorization, content-type" } }),
+      request(`${API}/sessions`, { method: "OPTIONS", headers: { origin: WEB, "access-control-request-method": "POST", "access-control-request-headers": "authorization, content-type" } }),
     );
     const allowed = res.headers.get("access-control-allow-origin");
     return { ok: allowed === WEB || allowed === "*", detail: `${res.status}, allow-origin ${allowed ?? "none"}` };
   }),
   await check("Web build answers", async () => {
-    const { res, ms } = await timed(() => fetch(`${WEB}/`));
+    const { res, ms } = await timed(() => request(`${WEB}/`));
     const html = await res.text();
     const titled = /<title>Lumente/.test(html);
     return { ok: res.status === 200 && titled, detail: `${res.status} in ${ms} ms${titled ? "" : ", no Lumente title"}` };
   }),
   await check("Web build points at this API", async () => {
-    const html = await (await fetch(`${WEB}/`)).text();
+    const html = await (await request(`${WEB}/`)).text();
     const scripts = [...html.matchAll(/<script[^>]+src="([^"]+)"/g)].map((m) => m[1]!);
     const host = new URL(API).host;
     for (const src of scripts) {
-      const js = await (await fetch(src.startsWith("http") ? src : `${WEB}${src}`)).text();
+      const js = await (await request(new URL(src, WEB).href)).text();
       if (js.includes(host)) return { ok: true, detail: `${host} in ${src.split("/").pop()}` };
     }
     return { ok: false, detail: `${host} is in none of ${scripts.length} scripts (demo mode, or exported without the production environment)` };

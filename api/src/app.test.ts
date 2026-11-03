@@ -3,6 +3,7 @@ import { generateKeyPairSync, sign, type KeyObject } from "node:crypto";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { test, type TestContext } from "node:test";
+import { deflateSync, gzipSync } from "node:zlib";
 import {
   AGENTS,
   FACT_DESK_REDIRECT,
@@ -45,14 +46,44 @@ const noDb: AppOptions = {
 };
 const as = (user: string, key = KEY) => ({ "x-dev-user": user, "x-dev-key": key });
 
+test("a transcript can restore its owner's original material without changing older responses", async (t) => {
+  const url = await start(t, withStore());
+  const first = await (await post(url, { concept: "API", material: "Original notes" })).json();
+  const path = `${url}/sessions/${first.sessionId}/transcript`;
+  assert.equal((await (await fetch(`${path}?material=1`, { headers: as("leo") })).json()).material, "Original notes");
+  assert.equal("material" in await (await fetch(path, { headers: as("leo") })).json(), false);
+  assert.equal((await fetch(`${path}?material=1`, { headers: as("other") })).status, 404);
+});
+
+test("compressed JSON with trailing bytes is rejected before authentication and leaves the API healthy", async (t) => {
+  const url = await start(t, noDb);
+  for (const [encoding, compress] of [["gzip", gzipSync], ["deflate", deflateSync]] as const) {
+    const response = await fetch(`${url}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-encoding": encoding },
+      body: Buffer.concat([compress('{"concept":"API"}'), Buffer.from("trailing")]),
+    });
+    assert.equal(response.status, 415);
+  }
+  assert.equal((await fetch(`${url}/health`)).status, 200);
+});
+
 // The Store contract kept in memory, so the routes can be tested without a database. `logs` are its agent_log rows.
-function memoryStore(): Store & { logs: readonly AgentLogEntry[] } {
+function memoryStore(): Store & { logs: readonly AgentLogEntry[]; expireTurnClaim(user: string, id: string, turn: number): void } {
   const sessions = new Map<string, Session>();
   const mastery = new Map<string, Mastery>();
   const logs: AgentLogEntry[] = [];
+  const turnClaims = new Map<string, { user: string; turn: number; claimId: string; until: number }>();
+  const turnClaimAttempts = new Map<string, number>();
+  const turnClaimKey = (id: string, turn: number) => `${id}:${turn}`;
   let created = 0;
   return {
     logs,
+    async insertSession(session) {
+      assert.ok(session.lastTurn);
+      assert.equal(sessions.has(session.id), false);
+      sessions.set(session.id, structuredClone(session));
+    },
     async createSession(user, input) {
       const session: Session = { ...initialSession(user, input), id: `s${++created}`, createdAt: new Date().toISOString() };
       sessions.set(session.id, session);
@@ -68,9 +99,14 @@ function memoryStore(): Store & { logs: readonly AgentLogEntry[] } {
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))
         .map(({ id, concept, mode, createdAt, result }) => ({ id, concept, mode, createdAt, finished: result !== null, score: result?.score ?? null, predictedScore: result?.predictedScore ?? null }));
     },
-    async saveSession(session, previousTurn, progress = []) {
+    async saveSession(session, previousTurn, progress = [], claimId) {
       if (sessions.get(session.id)?.turn !== previousTurn) return false;
+      const key = turnClaimKey(session.id, previousTurn);
+      const held = turnClaims.get(key);
+      if (claimId === undefined && held !== undefined) return false;
+      if (claimId !== undefined && held?.claimId !== claimId) return false;
       sessions.set(session.id, structuredClone(session));
+      turnClaims.delete(key);
       // in the same step, as the SurrealDB store's transaction: the level never drops, the successes add up
       const now = await this.getMastery(session.user);
       const moves = now.moves.map((m) => {
@@ -78,6 +114,41 @@ function memoryStore(): Store & { logs: readonly AgentLogEntry[] } {
         return p ? { move: m.move, level: Math.max(m.level, p.level) as Mastery["moves"][number]["level"], unassistedSuccesses: m.unassistedSuccesses + p.gained } : m;
       });
       if (progress.length > 0) mastery.set(session.user, { moves });
+      return true;
+    },
+    async claimTurn(user, id, turn, claimId) {
+      const session = sessions.get(id);
+      if (session?.user !== user || session.turn !== turn) return null;
+      const key = turnClaimKey(id, turn);
+      const held = turnClaims.get(key);
+      if (held && held.until > Date.now()) return null;
+      const attempts = (turnClaimAttempts.get(key) ?? 0) + 1;
+      if (attempts > 2) return null;
+      turnClaimAttempts.set(key, attempts);
+      turnClaims.set(key, { user, turn, claimId, until: Date.now() + 120_000 });
+      return attempts;
+    },
+    async turnClaimState(user, id, turn) {
+      const session = sessions.get(id);
+      if (session?.user !== user || session.turn !== turn) return null;
+      const held = turnClaims.get(turnClaimKey(id, turn));
+      return {
+        active: held?.user === user && held.until > Date.now(),
+        attempts: turnClaimAttempts.get(turnClaimKey(id, turn)) ?? 0,
+      };
+    },
+    expireTurnClaim(user, id, turn) {
+      const held = turnClaims.get(turnClaimKey(id, turn));
+      if (held?.user === user) held.until = Date.now() - 1;
+    },
+    async releaseTurn(user, id, claimId) {
+      for (const [key, held] of turnClaims) if (held.user === user && key.startsWith(`${id}:`) && held.claimId === claimId) turnClaims.delete(key);
+    },
+    async renewTurnClaim(user, id, turn, claimId) {
+      const key = turnClaimKey(id, turn);
+      const held = turnClaims.get(key);
+      if (held?.user !== user || held.claimId !== claimId) return false;
+      held.until = Date.now() + 120_000;
       return true;
     },
     async getMastery(user) {
@@ -89,6 +160,16 @@ function memoryStore(): Store & { logs: readonly AgentLogEntry[] } {
       const now = await this.getMastery(user);
       mastery.set(user, { moves: now.moves.map((m) => structuredClone(saved.moves.find((s) => s.move === m.move) ?? m)) });
     },
+    async beginAgentCall(entry) {
+      const id = String(logs.length);
+      logs.push(entry);
+      return id;
+    },
+    async finishAgentCall(id, entry) {
+      const index = Number(id);
+      assert.ok(logs[index]);
+      logs[index] = entry;
+    },
     async logAgentCall(entry) {
       logs.push(entry);
     },
@@ -98,7 +179,7 @@ function memoryStore(): Store & { logs: readonly AgentLogEntry[] } {
     },
     async memoryReads(user) {
       return logs
-        .filter((entry) => sessions.get(entry.session)?.user === user && (entry.agent === "hint_giver" || entry.agent === "coach"))
+        .filter((entry) => sessions.get(entry.session)?.user === user && entry.outcome !== "started" && (entry.agent === "hint_giver" || entry.agent === "coach"))
         .map((entry) => ((entry.input as { memory?: { facts: { id: string }[] } }).memory?.facts ?? []).map((fact) => fact.id));
     },
     async sessionConcepts(user, ids) {
@@ -170,11 +251,22 @@ function fakeClaude(replies: [keyof typeof AGENTS, unknown][], store?: Store) {
     return { message: { content: [{ type: "text", text: JSON.stringify(output) }], stop_reason: "end_turn", usage }, headers: new Headers() };
   };
   const logged: AgentLogEntry[] = [];
-  const log = async (entry: AgentLogEntry) => {
-    logged.push(entry);
-    await store?.logAgentCall(entry);
+  const logIndexes = new Map<string, number>();
+  const log = {
+    async begin(entry: AgentLogEntry) {
+      const id = store ? await store.beginAgentCall(entry) : String(logged.length);
+      logIndexes.set(id, logged.length);
+      logged.push(entry);
+      return id;
+    },
+    async finish(id: string, entry: AgentLogEntry) {
+      const index = logIndexes.get(id);
+      assert.notEqual(index, undefined);
+      logged[index!] = entry;
+      await store?.finishAgentCall(id, entry);
+    },
   };
-  const callAgentFor = createCallAgent({ send, model: "claude-opus-5-5", budgetUsd: 10, log });
+  const callAgentFor = createCallAgent({ send, countInputTokens: async () => 1_000, model: "claude-opus-5-5", budgetUsd: 10, log });
   return { callAgentFor, logged };
 }
 
@@ -320,6 +412,47 @@ test("a new session and its first Turn match the schemas in @build-north/agents"
   assert.doesNotThrow(() => TurnSchema.parse(turn));
 });
 
+test("failed session initialization never persists an invisible session", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const store = memoryStore();
+  const create = t.mock.method(store, "createSession");
+  const url = await start(t, { ...noDb, store, advance: async () => { throw new Error("initialization failed"); } });
+  assert.equal((await post(url, { concept: "API" })).status, 500);
+  assert.equal(create.mock.callCount(), 0, "initialization must precede the first database write");
+  assert.deepEqual(await store.listSessions("leo"), []);
+});
+
+test("a start idempotency key survives API recreation, rejects changed input, and is scoped to its learner", async (t) => {
+  const store = memoryStore();
+  const headers = { ...as("leo"), "idempotency-key": "start-request-1" };
+  const url = await start(t, { ...noDb, store });
+  const first = await (await post(url, { concept: "API" }, headers)).json();
+  const advanced = await answer(url, first.sessionId, { turn: first.turn, prediction: 5 });
+  assert.equal(advanced.status, 200);
+  const restarted = await start(t, { ...noDb, store });
+  const replay = await post(restarted, { concept: "API" }, headers);
+  assert.equal(replay.status, 201);
+  assert.deepEqual(await replay.json(), first);
+  assert.equal((await store.listSessions("leo")).length, 1);
+  assert.equal((await post(restarted, { concept: "different" }, headers)).status, 409);
+  const other = await (await post(restarted, { concept: "API" }, { ...as("other"), "idempotency-key": "start-request-1" })).json();
+  assert.notEqual(other.sessionId, first.sessionId);
+});
+
+test("invalid start keys and failed inserts do not create sessions or report success", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const store = memoryStore();
+  const insert = t.mock.method(store, "insertSession", async () => { throw new Error("database unavailable"); });
+  const url = await start(t, { ...noDb, store });
+  for (const key of ["contains space", "x".repeat(129), "contains/slash"]) {
+    assert.equal((await post(url, { concept: "API" }, { ...as("leo"), "idempotency-key": key })).status, 400);
+  }
+  assert.equal(insert.mock.callCount(), 0);
+  assert.equal((await post(url, { concept: "API" }, { ...as("leo"), "idempotency-key": "valid-key" })).status, 500);
+  assert.equal(insert.mock.callCount(), 1);
+  assert.deepEqual(await store.listSessions("leo"), []);
+});
+
 test("/turns replays the session-1 fixture one Turn per answer, then the session is over", async (t) => {
   const warned = t.mock.method(console, "warn", () => {});
   const url = await start(t, withStore());
@@ -385,6 +518,57 @@ test("a Turn whose agent failed adds no step, and a session saved before Oct 25 
   assert.deepEqual(await transcript(), []);
 });
 
+test("a recovered Turn runs once and refuses a third handler attempt", async (t) => {
+  const store = memoryStore();
+  const claimedAttempts: number[] = [];
+  let answers = 0;
+  const advanceWithFailure: Advance = async (state, input, callAgent) => {
+    if ("action" in input && input.action === "start") return advanceStub(state, input, callAgent);
+    answers++;
+    return { ...state, turn: { ...state.session.lastTurn!, error: { code: "agent_failed", retryable: true } } };
+  };
+  const callAgentFor: AppOptions["callAgentFor"] = (_session, _user, _turn, turnAttempt) => {
+    if (turnAttempt !== undefined) claimedAttempts.push(turnAttempt);
+    return callAgentStub;
+  };
+  const url = await start(t, { ...noDb, store, advance: advanceWithFailure, callAgentFor });
+  const { sessionId } = await (await post(url, { concept: "democracy" })).json();
+
+  const first = await (await answer(url, sessionId, { turn: 1, prediction: 5 })).json();
+  assert.deepEqual(first.error, { code: "agent_failed", retryable: true });
+  const recovered = await (await answer(url, sessionId, { turn: 1, prediction: 5 })).json();
+  assert.deepEqual(recovered.error, { code: "agent_failed", retryable: false });
+  const blocked = await (await answer(url, sessionId, { turn: 1, prediction: 5 })).json();
+  assert.deepEqual(blocked.error, { code: "agent_failed", retryable: false });
+  assert.equal(answers, 2, "the exhausted retry must not re-enter the orchestrator");
+  assert.deepEqual(claimedAttempts, [1, 2]);
+});
+
+test("a waiting request reclaims a crashed Turn once its durable lease expires", async (t) => {
+  const store = memoryStore();
+  const claimedAttempts: number[] = [];
+  const callAgentFor: AppOptions["callAgentFor"] = (_session, _user, _turn, turnAttempt) => {
+    if (turnAttempt !== undefined) claimedAttempts.push(turnAttempt);
+    return callAgentStub;
+  };
+  const url = await start(t, { ...noDb, store, advance: advanceStub, callAgentFor });
+  const { sessionId } = await (await post(url, { concept: "democracy" })).json();
+  assert.equal(await store.claimTurn("leo", sessionId, 1, "crashed-handler"), 1);
+  const state = store.turnClaimState.bind(store);
+  let polls = 0;
+  t.mock.method(store, "turnClaimState", async (...args: Parameters<Store["turnClaimState"]>) => {
+    if (++polls === 1) return { active: true, attempts: 1 };
+    store.expireTurnClaim("leo", sessionId, 1);
+    return state(...args);
+  });
+
+  const recovered = await answer(url, sessionId, { turn: 1, prediction: 5 });
+  assert.equal(recovered.status, 200);
+  assert.equal((await recovered.json()).turn, 2);
+  assert.ok(polls >= 2);
+  assert.deepEqual(claimedAttempts, [2]);
+});
+
 test("POST /sessions on CORS starts a session about CORS when Cynthia's advance runs; the rig's default, the stub, says democracy (#163)", async (t) => {
   // `advance` is the real orchestrator from @build-north/agents, not the stub the rig's `noDb` passes; a start calls
   // no agent, so an empty script is enough
@@ -422,27 +606,40 @@ test("a resent answer gets the same Turn back, and advance runs once", async (t)
 test("two answers to the same Turn at once move the session on once", { timeout: 5_000 }, async (t) => {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => (release = resolve));
-  let waiting = 0;
-  // Holds both answers inside advance until each request has read the session, and tags each Turn
-  // with the answer it got, so a request that lost the save can't pass for the winner.
+  let entered = 0;
+  let advances = 0;
+  let claims = 0;
+  const firstAdvance = Promise.withResolvers<void>();
+  // Hold the winner inside advance while the duplicate request reaches the durable turn claim.
   const slow: Advance = async (state, input, callAgent) => {
+    advances++;
     const next = await advanceStub(state, input, callAgent);
     if (!("prediction" in input)) return next;
-    waiting++;
+    entered++;
+    firstAdvance.resolve();
     await gate;
     const tagged = { ...next.turn, messages: [{ agent: "app" as const, kind: "feedback" as const, text: `predicted ${input.prediction}` }] };
     return { ...next, session: { ...next.session, lastTurn: tagged }, turn: tagged };
   };
-  const url = await start(t, { ...withStore(), advance: slow });
+  const store = memoryStore();
+  const claimTurn = store.claimTurn.bind(store);
+  t.mock.method(store, "claimTurn", async (...args: Parameters<Store["claimTurn"]>) => {
+    claims++;
+    return claimTurn(...args);
+  });
+  const url = await start(t, { ...noDb, store, advance: slow });
   const { sessionId } = await (await post(url, { concept: "democracy" })).json();
   const both = [answer(url, sessionId, { turn: 1, prediction: 7 }), answer(url, sessionId, { turn: 1, prediction: 3 })];
-  while (waiting < 2) await new Promise((resolve) => setImmediate(resolve));
+  await firstAdvance.promise;
+  while (claims < 2) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(entered, 1, "the concurrent duplicate must not enter advance or spend another model call");
   release();
   const [a, b] = await Promise.all(both.map(async (res) => (await res).json()));
   assert.deepEqual(a, b);
   const latest = await (await fetch(`${url}/sessions/${sessionId}`, { headers: as("leo") })).json();
   assert.deepEqual(latest, a);
   assert.equal(latest.turn, 2);
+  assert.equal(advances, 2, "one start and one answer run through advance");
 });
 
 test("a body the latest Turn doesn't ask for, or a Turn from the future, gets a 409 with the latest Turn", async (t) => {
@@ -811,7 +1008,7 @@ test("mastery is written only for the moves a Turn changed, and an error Turn wr
   const first = await (await post(url, { concept: "democracy" })).json();
   assert.equal((await answer(url, first.sessionId, { turn: 1, prediction: 7 })).status, 200);
   assert.equal(masterySaves.mock.callCount(), 0);
-  assert.equal(sessionSaves.mock.callCount(), 2);
+  assert.equal(sessionSaves.mock.callCount(), 1);
 
   // a Claude call that fails: the error Turn goes back, and neither the session nor mastery is written, so
   // nothing stale can overwrite what a parallel request saved meanwhile
@@ -942,13 +1139,13 @@ test("an agent_log row still being written when Delete my data comes is written 
   const store = memoryStore();
   const writing = Promise.withResolvers<void>();
   const held = Promise.withResolvers<void>();
-  const log = store.logAgentCall;
-  t.mock.method(store, "logAgentCall", async function (this: Store, entry: AgentLogEntry) {
+  const begin = store.beginAgentCall;
+  t.mock.method(store, "beginAgentCall", async function (this: Store, entry: AgentLogEntry) {
     if (entry.agent === "fact_desk") {
       writing.resolve();
       await held.promise;
     }
-    return log.call(this, entry);
+    return begin.call(this, entry);
   });
   const claude = fakeClaude([["fact_desk", { kind: "fact", answer: "Yes, a pond is one.", questionType: "fact" }]], store);
   const url = await start(t, { ...noDb, store, advance, callAgentFor: claude.callAgentFor });
@@ -983,7 +1180,13 @@ test("a call that outlives its Turn (the next question asked ahead, when the eva
       }
       return { message: { content: [{ type: "text", text: question }], stop_reason: "end_turn", usage }, headers: new Headers() };
     };
-    const callAgentFor = createCallAgent({ send, model: "claude-opus-5-5", budgetUsd: 10, log: (entry) => store.logAgentCall(entry) });
+    const callAgentFor = createCallAgent({
+      send, countInputTokens: async () => 1_000, model: "claude-opus-5-5", budgetUsd: 10,
+      log: {
+        begin: (entry) => store.beginAgentCall(entry),
+        finish: (id, entry) => store.finishAgentCall(id, entry),
+      },
+    });
     const url = await start(t, { ...noDb, store, advance, callAgentFor });
     const first = await toFirstQuestion(url);
     // optionally hold the Turn before its agent calls, so the delete begins before they start
@@ -1149,6 +1352,22 @@ test("learnerWrites: a delete waits for the learner's writes in flight and stops
   assert.equal(await writes.run("leo", async () => "written"), "written");
 });
 
+test("learnerWrites: a slow deletion returns an error without releasing its fence", async () => {
+  const writes = learnerWrites(20);
+  const held = Promise.withResolvers<void>();
+  const erased = Promise.withResolvers<void>();
+  const turn = writes.run("leo", () => held.promise);
+  const deleting = writes.erase("leo", async () => erased.resolve()).then(() => null, (error: Error) => error);
+  const later = writes.run("leo", async () => "must not start").then(() => null, (error: Error) => error);
+  const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), 50));
+  const [deletionResult, writeResult] = await Promise.all([Promise.race([deleting, timeout]), Promise.race([later, timeout])]);
+
+  held.resolve();
+  await Promise.all([turn, erased.promise, deleting, later]);
+  assert.ok(deletionResult instanceof Error && deletionResult.name === "MemoryError");
+  assert.ok(writeResult instanceof Error && writeResult.name === "MemoryError");
+});
+
 test("a Turn off the contract is never saved: the learner gets the latest Turn again with error set, and the session stays readable", async (t) => {
   const errors = t.mock.method(console, "error", () => {});
   // An orchestrator that puts a scaffold with no blanks on the Turn, the shape #139 found: valid for the questioner's
@@ -1173,15 +1392,15 @@ test("a Turn off the contract is never saved: the learner gets the latest Turn a
   // the answer is the latest Turn with error set (CONTRACTS.md section 5), nothing was written, and the reason is logged
   assert.equal(res.status, 200);
   assert.deepEqual(await res.json(), { ...first, error: { code: "agent_failed", retryable: true } });
-  assert.equal(sessionSaves.mock.callCount(), 1); // the start only
+  assert.equal(sessionSaves.mock.callCount(), 0); // creation uses insertSession, not an update
   assert.equal(masterySaves.mock.callCount(), 0);
-  assert.match(String(errors.mock.calls[0]?.arguments[0]), /Turn 2 of session s1 is off the contract and wasn't saved: scaffold\.blanks/);
+  assert.match(String(errors.mock.calls[0]?.arguments[0]), /Turn 2 of session [a-z0-9]+ is off the contract and wasn't saved: scaffold\.blanks/);
   // the same answer sent again, once the orchestrator behaves, moves the session on as usual
   drift = false;
   const retried = await (await answer(url, first.sessionId, { turn: 1, prediction: 7 })).json();
   assert.deepEqual([retried.turn, retried.error], [2, null]);
   assert.doesNotThrow(() => TurnSchema.parse(retried));
-  assert.equal(sessionSaves.mock.callCount(), 2);
+  assert.equal(sessionSaves.mock.callCount(), 1);
 });
 
 test("with memory on, the hint giver and the coach get what earlier sessions left and the app gets the sources of what they cite; the result writes the session's facts; the sheet reads; Delete my data purges first", async (t) => {

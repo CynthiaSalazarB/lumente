@@ -94,7 +94,11 @@ export function sheetOf(sessions: readonly Session[], salt: string): { rows: She
   return { rows, maps };
 }
 
-const cell = (value: string) => (/[",\n]/.test(value) ? `"${value.replaceAll('"', '""')}"` : value);
+const cell = (value: string) => {
+  // CSV quoting alone doesn't stop a spreadsheet from evaluating learner-controlled text.
+  const text = /^[\s\u0000-\u001f]*[=+@-]|^[\t\r\n]/.test(value) ? `'${value}` : value;
+  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+};
 
 /** The sheet as CSV text, header first, one line per row, in the sheet's column order. */
 export function toCsv(rows: readonly SheetRow[]): string {
@@ -111,7 +115,7 @@ async function main(out: string): Promise<number> {
     console.error("SURREAL_URL is unset: set the SURREAL_* variables for the database to export from");
     return 2;
   }
-  const db = connectSurreal(config);
+  const db = await connectSurreal(config);
   try {
     const [rows] = await db
       .query('SELECT *, record::id(id) AS id FROM session WHERE mode = "test" AND result != NONE ORDER BY createdAt')

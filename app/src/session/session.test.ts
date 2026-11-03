@@ -14,6 +14,13 @@ import { arrived, blankMap, drafted, echoFor, failed, initialState, partOf, rece
 const fixtureTurns = sessionOne.map((step) => Turn.parse(step.turn));
 const first = fixtureTurns[0]!;
 
+test("a recovered submitted answer is shown only while its Turn still awaits it", () => {
+  const asking = fixtureTurns.find((turn) => turn.expects === "text")!;
+  const state = { ...startedWith(asking), answer: { move: partOf(asking), text: "Recovered", turn: asking.turn } };
+  assert.equal(unsentOf(state), "Recovered");
+  assert.equal(unsentOf({ ...state, turn: { ...asking, turn: asking.turn + 1 } }), "");
+});
+
 test("the fixture client clicks through the whole recorded API session, then stops", async () => {
   const client = createFixtureClient(0);
   let state = received(initialState, await client.start({ concept: "API" }));
@@ -128,14 +135,92 @@ test("a Clerk token goes instead of the dev headers", async () => {
   assert.deepEqual(calls[0]!.init.headers, { "content-type": "application/json", authorization: "Bearer tok" });
 });
 
+test("a start retry sends its persisted key only on session creation", async () => {
+  const { fetch, calls } = fakeFetch(201, first);
+  const client = createApiClient({ baseUrl: "http://api.test", fetch });
+  await client.start({ concept: "democracy" }, "persisted-start-key");
+  await client.send("ses_1", { turn: 1, prediction: 7 });
+  assert.equal((calls[0]!.init.headers as Record<string, string>)["Idempotency-Key"], "persisted-start-key");
+  assert.equal((calls[1]!.init.headers as Record<string, string>)["Idempotency-Key"], undefined);
+});
+
+test("a turn retries one lost response with the exact same request body", async () => {
+  const calls: Call[] = [];
+  const fetch = (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    if (calls.length === 1) throw new TypeError("connection reset after the server handled the turn");
+    return Response.json(first);
+  }) as unknown as typeof globalThis.fetch;
+  const body = { turn: 1, prediction: 7 };
+  const turn = await createApiClient({ baseUrl: "http://api.test", fetch }).send("ses_1", body);
+  assert.deepEqual(turn, first);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map((call) => [call.url, call.init.body]), [
+    ["http://api.test/sessions/ses_1/turns", JSON.stringify(body)],
+    ["http://api.test/sessions/ses_1/turns", JSON.stringify(body)],
+  ]);
+});
+
+test("a turn retries one 5xx response with the exact same request body", async () => {
+  const calls: Call[] = [];
+  const fetch = (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    return Response.json({ error: "server restarted" }, { status: 503 });
+  }) as unknown as typeof globalThis.fetch;
+  const body = { turn: 1, prediction: 7 };
+  await assert.rejects(createApiClient({ baseUrl: "http://api.test", fetch }).send("ses_1", body), { status: 503, retryable: true });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map((call) => [call.url, call.init.body]), [
+    ["http://api.test/sessions/ses_1/turns", JSON.stringify(body)],
+    ["http://api.test/sessions/ses_1/turns", JSON.stringify(body)],
+  ]);
+});
+
+test("a recovered Turn deadline covers the duplicate wait and normal request window", async (t) => {
+  const delays: number[] = [];
+  const originalSetTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, "setTimeout", ((...args: Parameters<typeof setTimeout>) => {
+    if (typeof args[1] === "number") delays.push(args[1]);
+    return originalSetTimeout(...args);
+  }) as typeof setTimeout);
+  let calls = 0;
+  const fetch = (async () => {
+    if (++calls === 1) throw new TypeError("connection reset");
+    return Response.json(first);
+  }) as unknown as typeof globalThis.fetch;
+  await createApiClient({ baseUrl: "http://api.test", fetch }).send("ses_1", { turn: 1, prediction: 7 });
+  assert.deepEqual(delays.filter((delay) => delay >= 90_000), [90_000, 225_000]);
+});
+
+test("a turn recovery stops after one retry, and session starts do not auto-replay", async () => {
+  let turnCalls = 0;
+  const unavailable = (async () => {
+    turnCalls++;
+    throw new TypeError("network");
+  }) as unknown as typeof globalThis.fetch;
+  const client = createApiClient({ baseUrl: "http://api.test", fetch: unavailable });
+  await assert.rejects(client.send("ses_1", { turn: 1, prediction: 7 }), { status: null, retryable: true });
+  assert.equal(turnCalls, 2);
+
+  let startCalls = 0;
+  const startUnavailable = (async () => {
+    startCalls++;
+    throw new TypeError("network");
+  }) as unknown as typeof globalThis.fetch;
+  await assert.rejects(createApiClient({ baseUrl: "http://api.test", fetch: startUnavailable }).start({ concept: "API" }), { status: null, retryable: true });
+  assert.equal(startCalls, 1, "session creation needs its existing persisted idempotency key before automatic replay");
+});
+
 test("a 409 with the latest Turn is drawn; other errors carry the server's message", async () => {
   assert.deepEqual(await createApiClient({ baseUrl: "http://api.test", fetch: fakeFetch(409, first).fetch }).send("s", { turn: 9, text: "x" }), first);
 
   const conflict = createApiClient({ baseUrl: "http://api.test", fetch: fakeFetch(409, { error: "This session is over" }).fetch });
   await assert.rejects(conflict.send("s", { turn: 9, text: "x" }), { message: "This session is over", retryable: false });
 
-  const busy = createApiClient({ baseUrl: "http://api.test", fetch: fakeFetch(429, { error: "Too many requests" }).fetch });
+  const busyResponse = fakeFetch(429, { error: "Too many requests" });
+  const busy = createApiClient({ baseUrl: "http://api.test", fetch: busyResponse.fetch });
   await assert.rejects(busy.send("s", { turn: 1, text: "x" }), { status: 429, retryable: true });
+  assert.equal(busyResponse.calls.length, 1, "429 remains available for an explicit retry after its wait message");
 
   const down = createApiClient({ baseUrl: "http://api.test", fetch: (async () => { throw new TypeError("network"); }) as unknown as typeof fetch });
   await assert.rejects(down.start({ concept: "x" }), { status: null, retryable: true });
@@ -178,8 +263,8 @@ const savedSteps = sessionOne.map((step, i) => ({ body: i === 0 ? null : ({ ...s
 test("a session's steps are read with GET /sessions/:id/transcript and checked against the contract", async () => {
   const { fetch, calls } = fakeFetch(200, { steps: savedSteps });
   const client = createApiClient({ baseUrl: "http://api.test", getToken: async () => "tok", fetch });
-  assert.deepEqual(await client.transcript("ses 1"), savedSteps);
-  assert.equal(calls[0]!.url, "http://api.test/sessions/ses%201/transcript");
+  assert.deepEqual(await client.transcript("ses 1"), { steps: savedSteps });
+  assert.equal(calls[0]!.url, "http://api.test/sessions/ses%201/transcript?material=1");
   assert.equal(calls[0]!.init.method, "GET");
   const gone = createApiClient({ baseUrl: "http://api.test", fetch: fakeFetch(404, { error: "Not found" }).fetch });
   await assert.rejects(gone.transcript("ses_1"), { status: 404 });
@@ -206,6 +291,12 @@ test("a session picked up again replays every saved step: the same conversation 
   // every part's closing and the last part's note, which the result screen reads from the conversation, are back
   assert.deepEqual(partClosingsOf(back.entries), partClosingsOf(live.entries));
   assert.deepEqual(lastPartNoteOf(back.entries), lastPartNoteOf(live.entries));
+});
+
+test("resuming can recover original material without a device cache", async () => {
+  const { fetch } = fakeFetch(200, { steps: savedSteps, material: "Original notes" });
+  const client = createApiClient({ baseUrl: "http://api.test", fetch });
+  assert.deepEqual(await client.transcript("s1"), { steps: savedSteps, material: "Original notes" });
 });
 
 test("an answer whose reply lands after the session was picked up again keeps the learner's words", () => {
@@ -379,6 +470,38 @@ test("a guided answer typed and not sent stays with its part, comes back on that
   assert.deepEqual(arrived(typing, body!, turn).answer, typing.answer);
 });
 
+test("a stalled token lookup times out without sending a request after the token eventually arrives", async () => {
+  let token!: (value: string) => void;
+  let calls = 0;
+  const client = createApiClient({
+    baseUrl: "http://api.test", timeoutMs: 10,
+    getToken: () => new Promise<string>((resolve) => { token = resolve; }),
+    fetch: (async () => { calls++; return Response.json(first); }) as typeof fetch,
+  });
+  const request = client.start({ concept: "x" });
+  const release = setTimeout(() => token("late-token"), 60);
+  try {
+    await assert.rejects(request, { message: /taking too long/, status: null, retryable: true });
+    token("late-token");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(calls, 0);
+  } finally { clearTimeout(release); }
+});
+
+test("a fetch ignoring cancellation still times out before returning its headers", async () => {
+  const client = createApiClient({
+    baseUrl: "http://api.test", timeoutMs: 10,
+    fetch: (() => new Promise(() => {})) as typeof fetch,
+  });
+  let guard!: ReturnType<typeof setTimeout>;
+  const stalled = new Promise<never>((_, reject) => {
+    guard = setTimeout(() => reject(new Error("request remained pending past its deadline")), 100);
+  });
+  try {
+    await assert.rejects(Promise.race([client.start({ concept: "x" }), stalled]), { message: /taking too long/, status: null, retryable: true });
+  } finally { clearTimeout(guard); }
+});
+
 test("a body that stalls after the headers ends as a slow answer when the timer fires", async () => {
   const stalled = (async () => ({ status: 200, ok: true, json: () => new Promise(() => {}) })) as unknown as typeof fetch;
   const client = createApiClient({ baseUrl: "http://api.test", fetch: stalled, timeoutMs: 30 });
@@ -407,6 +530,8 @@ test("an answer the server refused for good goes back to the field and leaves th
   // a failure Try again can fix keeps the answer as it went: the retry sends that body again
   const dropped = failed(sending, body, "No connection.", true);
   assert.equal(dropped.answer, null);
+  assert.equal(typed(dropped, asking.sessionId, partOf(asking), "replacement"), dropped, "don't replace a body whose server outcome is uncertain");
+  assert.equal(typed(dropped, asking.sessionId, partOf(asking), "replacement", true), dropped, "the explicit edit path is guarded too");
   const echo = dropped.entries.at(-1);
   assert.equal(echo?.from === "learner" ? echo.text : null, body.text);
 });
