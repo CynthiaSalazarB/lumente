@@ -10,6 +10,7 @@ Lumente helps programming students who code with AI explain the ideas behind the
 
 <a href="https://lumente.expo.app"><img alt="Try it on the web" src="https://img.shields.io/badge/Try_it_on_the_web-f2b84b?style=for-the-badge" /></a>
 <a href="https://expo.dev/artifacts/eas/LVkBl_worJBs2ro5p6z9vFa1XtYyA992vF3QrkSzG_A.apk"><img alt="Get the Android app" src="https://img.shields.io/badge/Get_the_Android_app-16151a?style=for-the-badge&amp;logo=android&amp;logoColor=f2b84b" /></a>
+<a href="https://devpost.com/software/lumente"><img alt="See it on Devpost" src="https://img.shields.io/badge/See_it_on_Devpost-16151a?style=for-the-badge&amp;logo=devpost&amp;logoColor=f2b84b" /></a>
 
 <sub>Made for <a href="https://build-north.devpost.com/">Build North</a> (Georgian AI Lab + TapNet), October 2026</sub>
 
@@ -95,13 +96,14 @@ Research backs each part: help that fades, asking your own questions, explaining
 
 **Vision:** people who think for themselves, with or without AI. Curiosity is the engine, questions are the practice, and understanding is the result. We start with programming ideas and add one thinking skill at a time, and only when the evidence says we're ready.
 
-| Step | What people practice | Who it's for first |
-|---|---|---|
-| 1. Concepts (built now) | Explaining an idea and telling it apart from similar ones | Programming students who build with AI |
-| 2. Check the AI | Judging whether an AI's answer holds up | Every student, and anyone whose work runs through AI |
-| 3. Perspectives | Seeing other points of view | Teens and young adults |
-| 4. Decisions | Thinking through choices | Teens and young adults |
-| 5. Self-awareness, then the rest of life | The same skills, turned inward | Everyone |
+| Skill | With what |
+|---|---|
+| Questioning, interpretation, analysis, explanation, self-examination | Concepts: figuring an idea out, telling it apart from similar ones, explaining it in your own words, and checking your prediction against what you proved (built now) |
+| Evaluation, inference | What an AI tells you: judging whether its answer holds up and what follows from it |
+| Open-mindedness, fair-mindedness | Other perspectives: understanding other points of view before judging them |
+| Self-regulation: self-examination and self-correction | Your own assumptions: noticing what you take for granted, and revising it |
+
+Questioning is where it starts, and it runs under every row. The skills and dispositions come from the Delphi Report's consensus definition of critical thinking (Facione, 1990); questioning is its inquisitiveness, the drive to ask. Together, the four rows build critical thinking. We reach people in the same order: programming students first, then any discipline, then workplaces, then hiring, where candidates opt in.
 
 The help fades. The understanding stays.
 
